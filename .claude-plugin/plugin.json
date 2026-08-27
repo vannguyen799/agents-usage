@@ -1,0 +1,7 @@
+{
+  "name": "agents-usage",
+  "description": "Auto-records this machine's Claude Code token usage into the agent platform's ledger (POST /api/v1/usage/sessions). Cumulative and idempotent: hooks re-read the session transcript and send totals, so a hook that fires twice, or not at all, never mis-bills.",
+  "version": "0.1.0",
+  "author": { "name": "vannguyen799" },
+  "keywords": ["usage", "tokens", "hook", "telemetry", "claude-cli"]
+}
