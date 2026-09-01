@@ -46,7 +46,7 @@ import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
-USER_AGENT = "agents-usage/0.4.0 (claude-code-hook)"
+USER_AGENT = "agents-usage/0.4.1 (claude-code-hook)"
 """Sent on every report, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -373,11 +373,13 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
                 if not model or model.startswith("<"):
                     continue
 
-                # The per-TTL split is what `cache_creation` carries; the flat
-                # `cache_creation_input_tokens` is the older shape and has no TTL on
-                # it, so it falls into the 1-hour bucket -- the one Claude Code writes
-                # with, checked across these transcripts where the 5-minute count is 0
-                # throughout. Guessing the cheaper one would under-count that term 37%.
+                # The per-TTL split is what `cache_creation` carries, and it is read
+                # rather than assumed: the two TTLs weigh differently (x2 against
+                # x1.25) and both occur -- across 120 transcripts here, 95.7% of write
+                # tokens are 1-hour and 9% of sessions write some 5-minute ones.
+                # The flat `cache_creation_input_tokens` is the older shape and carries
+                # no TTL at all; it falls to the 1-hour bucket, the larger case, since
+                # guessing the cheaper one would under-count that term by 37.5%.
                 created = usage.get("cache_creation")
                 created = created if isinstance(created, dict) else {}
                 write_5m = num(created.get("ephemeral_5m_input_tokens"))
