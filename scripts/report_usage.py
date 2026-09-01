@@ -11,7 +11,8 @@ WHY THIS EXISTS
 
 WHAT IT SENDS
     Cumulative totals per model for ONE session, SPLIT BY RATE CLASS (uncached input,
-    cache read, 5-minute cache write, 1-hour cache write, output), upserted on
+    cache read, 5-minute cache write, 1-hour cache write, output) and the name of the
+    backend that served them, upserted on
     `cli:<sessionId>:<model>`. Cumulative, not incremental, is the whole design: hooks
     fire an unpredictable number of times, are retried, and can miss a turn entirely.
     Sending totals-so-far means the row converges regardless, and neither side has to
@@ -46,7 +47,7 @@ import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
-USER_AGENT = "agents-usage/0.4.1 (claude-code-hook)"
+USER_AGENT = "agents-usage/0.5.0 (claude-code-hook)"
 """Sent on every report, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -274,6 +275,39 @@ def device_of(config: dict) -> str:
     return ""
 
 
+REDIRECT_VARS = (
+    ("CLAUDE_CODE_USE_BEDROCK", "bedrock"),
+    ("CLAUDE_CODE_USE_VERTEX", "vertex"),
+    ("CLAUDE_CODE_USE_FOUNDRY", "foundry"),
+)
+"""Env flags that point Claude Code at a partner-operated backend."""
+
+
+def backend_of() -> str:
+    """
+    WHICH ENDPOINT this session was talking to.
+
+    The transcript records none -- scanned across 4001 assistant records, no field
+    names a backend -- so it is read from the environment instead. That works here and
+    nowhere else: this hook runs INSIDE the session it reports on, so its own
+    environment is that session's.
+
+    It matters because the server WEIGHTS these tokens, and the weights are Anthropic's
+    ratios. Bedrock, Vertex and Foundry are partner-operated with their own pricing, so
+    a redirected session is weighed on a tariff it was never billed at -- silently,
+    because the numbers still look ordinary. Naming the endpoint does not fix the
+    weighting; it ends the silence.
+
+    `ANTHROPIC_BASE_URL` is reported as the bare word `custom` and never as its value:
+    a base URL can carry a hostname, a port, a path and occasionally a token, and none
+    of that belongs in a label sent off the machine.
+    """
+    for var, name in REDIRECT_VARS:
+        if os.environ.get(var, "").strip() not in ("", "0", "false", "False"):
+            return name
+    return "custom" if os.environ.get("ANTHROPIC_BASE_URL", "").strip() else "firstParty"
+
+
 def nested_transcripts(transcript: Path) -> list[Path]:
     """
     Every transcript written UNDER the session's own directory: the sub-sessions the Task
@@ -424,6 +458,7 @@ def report(config: dict, session: str, models: dict, cwd: str) -> bool:
         "accountId": claude_account_id(),
         "project": project_of(cwd),
         "device": device_of(config),
+        "backend": backend_of(),
         "models": [{"model": model, **totals} for model, totals in sorted(models.items())],
     }).encode("utf-8")
 
@@ -509,6 +544,7 @@ def main() -> int:
                 "accountId": claude_account_id(),
                 "project": project_of(cwd),
                 "device": device_of(config),
+                "backend": backend_of(),
                 "models": [{"model": m, **t} for m, t in sorted(models.items())],
             }, indent=2))
             continue
