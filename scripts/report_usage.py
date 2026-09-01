@@ -37,6 +37,7 @@ Never fails a session: every error path exits 0 and stays quiet.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -117,35 +118,104 @@ def claude_account_id() -> str:
     return ""
 
 
+REMOTE_SCHEMES = ("ssh", "git", "http", "https")
+"""Remote URL schemes that name a SERVER. `file://` and the rest address a disk."""
+
+SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+"""What a segment of a repo slug may contain — notably neither `@` nor `:`."""
+
+
 @lru_cache(maxsize=256)
 def project_of(cwd: str) -> str:
     """
-    Which REPO the session ran in, as a path relative to this machine's home.
+    Which REPO the session ran in, as `owner/repo` read from its `origin` remote.
+
+    The remote and not the directory, because the remote is the repo's REAL name: one
+    project reads identically on every machine and in every checkout, however the
+    directory happened to be named, wherever it was cloned, and whether the session
+    started at the root or five levels down.
+
+    It also settles by itself the two cases the path could only guess at. A linked
+    WORKTREE and a SUBMODULE each carry their own `origin`, so a branch parked in /tmp
+    folds into its repo and a submodule gets its own line — with no path arithmetic and
+    no `worktree list`, which inside a submodule answers with the SUPERPROJECT'S
+    `.git/modules/…` gitdir and duly filed those sessions under exactly that.
+
+    Falls back to `path_label` when there is no remote to read: a repo that has none, a
+    directory that is not a repo at all, `safe.directory` refusing a checkout owned by
+    someone else. A vaguer name is recoverable; a wrong one is not.
+
+    Asked once per directory — memoised, because `--backfill` walks hundreds of
+    transcripts sharing a handful of repos — with a short timeout.
+    """
+    if not cwd:
+        return ""
+    return remote_slug(cwd) or path_label(cwd)
+
+
+def remote_slug(cwd: str) -> str:
+    """`owner/repo` from the `origin` remote, or "" when it cannot be read as one."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""  # no git, not a repo, or too slow
+    return slug_of(done.stdout.strip()) if done.returncode == 0 else ""
+
+
+def slug_of(url: str) -> str:
+    """
+    The PATH of a git remote URL as `owner/repo`; "" when the URL does not name one.
+
+    A REMOTE URL IS A CREDENTIAL CARRIER. `https://x-access-token:ghp_…@github.com/o/r`
+    is an ordinary thing to find in a checkout that a credential helper or a CI job
+    wrote, and `project` is sent to the server and rendered on /usage — so this keeps
+    the url's PATH and discards its AUTHORITY whole. A secret lives in the authority's
+    userinfo, so dropping the authority drops the secret BY CONSTRUCTION, rather than by
+    a pattern that would first have to recognise one. What survives is not trusted
+    either: every segment must match SAFE_SEGMENT, which admits neither `@` nor `:`, so
+    an authority that somehow slipped through cannot become a label.
+    """
+    scheme, sep, rest = url.partition("://")
+    if sep:
+        if scheme.lower() not in REMOTE_SCHEMES:
+            return ""              # file:// and friends address a disk, not a forge
+        path = rest.partition("/")[2]      # a `host:port` authority keeps its own colon
+    elif "@" in url.partition(":")[0]:
+        # scp-like `git@host:owner/repo.git` — no scheme, and the authority is
+        # everything up to the FIRST colon.
+        path = url.partition(":")[2]
+    else:
+        return ""                  # a bare local path — nothing here names a repo
+
+    if path.endswith(".git"):
+        path = path[:-len(".git")]
+    segments = [s for s in path.strip("/").split("/") if s]
+    # `owner/repo` at the least; a GitLab subgroup legitimately adds more.
+    if len(segments) < 2 or not all(SAFE_SEGMENT.match(s) for s in segments):
+        return ""
+    return "/".join(segments)
+
+
+def path_label(cwd: str) -> str:
+    """
+    The fallback name: the checkout's path relative to this machine's home.
 
     Relative on two counts: it keeps the username out of the value, and it makes one
     repo checked out on two machines read as ONE project rather than two unrelated
     absolute paths.
 
     Resolved through git rather than by taking the last path segment, because sessions
-    are routinely started inside a subdirectory — `acme/frontend/apps/storefront`
-    would otherwise be filed under `storefront`, which names nothing.
-
-    `worktree list` and not `rev-parse --show-toplevel`, because the toplevel of a LINKED
-    WORKTREE is the worktree: a branch parked in /tmp opens a second project line for a
-    repo that already has one, and — being outside home — reports an absolute path with
-    the username in it, which is the one thing relativising was for. The first entry
-    `worktree list` prints is the main checkout, from anywhere in the family, so every
-    worktree of a repo agrees on one label. A SUBMODULE deliberately does NOT fold into
-    its superproject: it is its own repo with its own history, and filing its sessions
-    under the parent would hide them.
-
-    Asked once per directory — memoised, because `--backfill` walks hundreds of
-    transcripts sharing a handful of repos — with a short timeout. Every failure (no git,
-    not a repo, `safe.directory` refusing a checkout owned by someone else) falls back to
-    the directory itself, which is still a usable label.
+    are routinely started inside a subdirectory — `acme/frontend/apps/storefront` would
+    otherwise be filed under `storefront`, which names nothing. `worktree list` and not
+    `rev-parse --show-toplevel`, because the toplevel of a LINKED WORKTREE is the
+    worktree: a branch parked in /tmp would open a second line for a repo that already
+    has one, and — being outside home — would report an absolute path with the username
+    in it, which is the one thing relativising was for. The first entry `worktree list`
+    prints is the main checkout, from anywhere in the family.
     """
-    if not cwd:
-        return ""
     root = cwd
     try:
         done = subprocess.run(

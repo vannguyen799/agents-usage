@@ -69,14 +69,18 @@ bill), `conversationId` = the session id, and `accountId` = the login's email re
 
 Each report also names **where** and **from what**:
 
-- `project` — the repo, as a path relative to your home (`acme/backend`).
-  Resolved with `git worktree list`, not by taking the last path segment: a session
-  started in `frontend/apps/storefront` belongs to its repo, not to `storefront`.
-  Relative keeps your username out of the value and makes the same repo on two machines
-  read as one project. A linked **worktree** folds into the checkout it was made from —
-  a branch parked in `/tmp` is the same project as the repo in your home, not a second
-  one under an absolute path. A **submodule** does not fold: it is its own repo and gets
-  its own line. Outside a repo, the directory is used as-is.
+- `project` — the repo as `owner/repo` (`acme/backend`), read from its `origin` remote.
+  The remote is the repo's real name, so one project reads the same on every machine and
+  in every checkout, however the directory was named and wherever it was cloned. A
+  session started in `frontend/apps/storefront` belongs to its repo, not to
+  `storefront`; a linked **worktree** folds into the repo it was made from, and a
+  **submodule** does not fold — it has its own `origin` and gets its own line.
+  Only the URL's **path** is used, never its authority: a remote that carries a
+  credential (`https://x-access-token:ghp_…@github.com/o/r`, which credential helpers
+  and CI jobs write routinely) cannot leak it into the label, because the half a secret
+  lives in is dropped before anything is parsed. With no `origin` to read — a repo
+  without one, or a directory that is not a repo — it falls back to the path relative to
+  your home, which keeps your username out of the value.
 - `device` — Claude Code's own `machineID` from `~/.claude.json`, truncated. It names a
   machine without carrying its hostname. Set `"device": "dev-pc"` in the config (or
   `AGENTS_USAGE_DEVICE`) for something a human can read. It is only a label: multi-device
