@@ -87,9 +87,18 @@ Each report also names **where** and **from what**:
   accounting is already correct without it, because the upsert key carries a session UUID
   that no two machines can collide on.
 
-Still nothing else. The payload is under 300 bytes: session id, account, project, device,
-and per-model token counts. No prompts, no answers, no file names, no tool names, no
-branch. The transcript is read in full to count tokens and nothing from it is sent.
+Token counts are sent **split by rate class** — uncached input, cache read, 5-minute
+cache write, 1-hour cache write, output — never folded into one figure. They are not
+interchangeable: a cache read counts for a TENTH of an uncached token, a 1-hour cache
+write for TWO, and output for FIVE. A long Claude Code session is ~98% cache reads, so
+one folded number reads about seven times heavier than the work actually was, and
+nothing can take it back apart afterwards. The server weights them into `billable_tokens`;
+this only has to keep them separate.
+
+Still nothing else. The payload is well under a kilobyte: session id, account, project,
+device, and per-model token counts. No prompts, no answers, no file names, no tool
+names, no branch. The transcript is read in full to count tokens and nothing from it
+is sent.
 
 ## Install
 

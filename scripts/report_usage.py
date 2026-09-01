@@ -10,7 +10,8 @@ WHY THIS EXISTS
     reports the other half in.
 
 WHAT IT SENDS
-    Cumulative totals per model for ONE session, upserted server-side on
+    Cumulative totals per model for ONE session, SPLIT BY RATE CLASS (uncached input,
+    cache read, 5-minute cache write, 1-hour cache write, output), upserted on
     `cli:<sessionId>:<model>`. Cumulative, not incremental, is the whole design: hooks
     fire an unpredictable number of times, are retried, and can miss a turn entirely.
     Sending totals-so-far means the row converges regardless, and neither side has to
@@ -45,7 +46,13 @@ import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
-USER_AGENT = "agents-usage/0.1.0 (claude-code-hook)"
+USER_AGENT = "agents-usage/0.4.0 (claude-code-hook)"
+"""Sent on every report, and the only thing that says WHICH copy called.
+
+It sat at 0.1.0 through two releases, so the one place a server could tell an old
+reporter from a new one named a version that had not run in months -- which mattered
+the moment the wire shape changed and the server had to handle both. CI now fails a
+release where this disagrees with plugin.json, so it cannot drift again."""
 
 TIMEOUT_S = 5
 """Only ever called from a hook, so the session waits on this — keep it short."""
@@ -304,9 +311,15 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
 
     Deduplicated on `message.id` across the whole set, not per file (see the module
     docstring), so a response that does reach both parent and subagent is still counted
-    once. Cache reads and cache writes fold into the prompt count, which is what the
-    platform's own providers do, so a token means the same thing on every row of the
-    ledger.
+    once.
+
+    THE CACHE CLASSES ARE SENT APART, not folded into the prompt count. They used to be
+    folded, and the result was a /usage page reporting 2.1 BILLION tokens for a month
+    of work: 98.3% of them were cache reads, which count for a TENTH of an uncached
+    token, while the writes count for MORE than one (1.25x at the 5-minute TTL, 2x at
+    the 1-hour one Claude Code uses) and output counts for FIVE. One folded number
+    cannot be taken back apart, so the weighting has to happen on counts that were
+    never merged. The server weights them; this only has to keep them separate.
 
     A record whose `entrypoint` is missing or unrecognised is SKIPPED, not reported.
     Under-reporting is visible in the numbers and recoverable; double-reporting is
@@ -360,18 +373,31 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
                 if not model or model.startswith("<"):
                     continue
 
-                prompt = (
-                    num(usage.get("input_tokens"))
-                    + num(usage.get("cache_read_input_tokens"))
-                    + num(usage.get("cache_creation_input_tokens"))
-                )
-                completion = num(usage.get("output_tokens"))
-                if prompt <= 0 and completion <= 0:
+                # The per-TTL split is what `cache_creation` carries; the flat
+                # `cache_creation_input_tokens` is the older shape and has no TTL on
+                # it, so it falls into the 1-hour bucket -- the one Claude Code writes
+                # with, checked across these transcripts where the 5-minute count is 0
+                # throughout. Guessing the cheaper one would under-count that term 37%.
+                created = usage.get("cache_creation")
+                created = created if isinstance(created, dict) else {}
+                write_5m = num(created.get("ephemeral_5m_input_tokens"))
+                write_1h = num(created.get("ephemeral_1h_input_tokens"))
+                if not write_5m and not write_1h:
+                    write_1h = num(usage.get("cache_creation_input_tokens"))
+
+                counts = {
+                    "promptTokens": num(usage.get("input_tokens")),
+                    "completionTokens": num(usage.get("output_tokens")),
+                    "cacheReadTokens": num(usage.get("cache_read_input_tokens")),
+                    "cacheWrite5mTokens": write_5m,
+                    "cacheWrite1hTokens": write_1h,
+                }
+                if not any(counts.values()):
                     continue
 
-                entry = per_model.setdefault(model, {"promptTokens": 0, "completionTokens": 0, "calls": 0})
-                entry["promptTokens"] += prompt
-                entry["completionTokens"] += completion
+                entry = per_model.setdefault(model, dict.fromkeys(counts, 0) | {"calls": 0})
+                for key, value in counts.items():
+                    entry[key] += value
                 entry["calls"] += 1
 
     return per_model, skipped, cwd

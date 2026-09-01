@@ -35,6 +35,18 @@ jobs:
             exit 1
           fi
 
+      - name: the reporter's User-Agent must name the same version
+        run: |
+          set -euo pipefail
+          plugin=$(jq -r '.version' .claude-plugin/plugin.json)
+          agent=$(sed -n 's/^USER_AGENT = "agents-usage\/\([0-9.]*\).*/\1/p' scripts/report_usage.py)
+          echo "plugin.json=$plugin  USER_AGENT=$agent"
+          if [ "$plugin" != "$agent" ]; then
+            echo "::error::USER_AGENT says $agent but plugin.json says $plugin."
+            echo "::error::That string is the only thing telling a server which copy called."
+            exit 1
+          fi
+
       - name: a change under scripts/ or hooks/ must bump the version
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}

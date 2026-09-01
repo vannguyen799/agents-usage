@@ -9,7 +9,7 @@
       "name": "agents-usage",
       "source": "./",
       "description": "Reports each Claude Code session's token usage to an agent platform's usage ledger, so a subscription's quota spend is visible in one place whether an agent or a human spent it.",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "keywords": ["usage", "tokens", "hook", "telemetry", "claude-cli"]
     }
   ]
