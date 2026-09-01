@@ -1,0 +1,19 @@
+{
+  "name": "vt-plugins",
+  "interface": {
+    "displayName": "VT plugins"
+  },
+  "plugins": [
+    {
+      "name": "agents-usage",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

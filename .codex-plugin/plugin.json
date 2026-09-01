@@ -1,0 +1,17 @@
+{
+  "name": "agents-usage",
+  "version": "0.7.0",
+  "description": "Auto-records this machine's Codex CLI token usage into the agent platform's ledger (POST /api/v1/usage/sessions). Cumulative and idempotent: the hooks re-read the session rollout and send totals, so a hook that fires twice, or not at all, never mis-bills.",
+  "author": { "name": "vannguyen799" },
+  "repository": "https://github.com/vannguyen799/agents-usage",
+  "license": "SEE LICENSE IN README.md",
+  "keywords": ["usage", "tokens", "hook", "telemetry", "codex-cli"],
+  "hooks": "./hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "Agents usage",
+    "shortDescription": "Report this machine's token usage to an agent platform",
+    "longDescription": "Reports each Codex CLI session's token usage to an agent platform's usage ledger, so a subscription's quota spend is visible in one place whether an agent or a human spent it. Sends counts only — no prompts, answers, file names or tool names.",
+    "developerName": "vannguyen799",
+    "category": "Developer Tools"
+  }
+}
