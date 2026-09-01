@@ -24,28 +24,45 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: plugin.json and marketplace.json must agree
+      - name: every manifest must name the same version
         run: |
           set -euo pipefail
           plugin=$(jq -r '.version' .claude-plugin/plugin.json)
           market=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
-          echo "plugin.json=$plugin  marketplace.json=$market"
-          if [ "$plugin" != "$market" ]; then
-            echo "::error::version mismatch — plugin.json says $plugin, marketplace.json says $market"
+          codex=$(jq -r '.version' .codex-plugin/plugin.json)
+          echo ".claude-plugin/plugin.json=$plugin  .claude-plugin/marketplace.json=$market  .codex-plugin/plugin.json=$codex"
+          if [ "$plugin" != "$market" ] || [ "$plugin" != "$codex" ]; then
+            echo "::error::version mismatch — $plugin vs $market vs $codex"
             exit 1
           fi
+          # Codex reads the version out of .codex-plugin/plugin.json and caches the
+          # plugin under it, so a stale one there pins every Codex machine to a copy
+          # that will never be replaced. The .agents marketplace carries no version
+          # of its own on purpose: one fewer place for this to go wrong.
 
-      - name: the reporter's User-Agent must name the same version
+      - name: the reporters' version must name the same version
         run: |
           set -euo pipefail
           plugin=$(jq -r '.version' .claude-plugin/plugin.json)
-          agent=$(sed -n 's/^USER_AGENT = "agents-usage\/\([0-9.]*\).*/\1/p' scripts/report_usage.py)
-          echo "plugin.json=$plugin  USER_AGENT=$agent"
+          agent=$(sed -n 's/^VERSION = "\([0-9.]*\)".*/\1/p' scripts/report_usage.py)
+          echo "plugin.json=$plugin  VERSION=$agent"
           if [ "$plugin" != "$agent" ]; then
-            echo "::error::USER_AGENT says $agent but plugin.json says $plugin."
-            echo "::error::That string is the only thing telling a server which copy called."
+            echo "::error::VERSION says $agent but plugin.json says $plugin."
+            echo "::error::It is the only thing in the User-Agent telling a server which copy called."
             exit 1
           fi
+          # Both reporters build their User-Agent from that one constant, so this
+          # check covers the Codex one too. Prove it rather than assume it:
+          if ! grep -q 'from report_usage import' scripts/report_codex_usage.py; then
+            echo "::error::the Codex reporter no longer shares VERSION — check it separately."
+            exit 1
+          fi
+
+      - name: the tally must still be pinned
+        run: python3 scripts/smoke_codex_tally.py
+
+      - name: and so must the way this machine names itself
+        run: python3 scripts/smoke_device.py
 
       - name: a change under scripts/ or hooks/ must bump the version
         env:
