@@ -37,29 +37,48 @@ THE TWO TRAPS THIS AVOIDS
 
 Never fails a session: every error path exits 0 and stays quiet.
 """
+import getpass
+import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from functools import lru_cache
 from pathlib import Path
 
-USER_AGENT = "agents-usage/0.6.0 (claude-code-hook)"
-"""Sent on every report, and the only thing that says WHICH copy called.
+VERSION = "0.7.0"
+"""The reporter's version, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
 reporter from a new one named a version that had not run in months -- which mattered
 the moment the wire shape changed and the server had to handle both. CI now fails a
-release where this disagrees with plugin.json, so it cannot drift again."""
+release where this disagrees with plugin.json, so it cannot drift again.
+
+The CODEX reporter imports it from here rather than keeping its own: two copies of a
+version string is two chances to ship one of them stale."""
+
+USER_AGENT = f"agents-usage/{VERSION} (claude-code-hook)"
+"""Sent on every report. urllib's default names Python and gets 403'd by a WAF."""
 
 TIMEOUT_S = 5
 """Only ever called from a hook, so the session waits on this — keep it short."""
 
-CONFIG_PATH = Path.home() / ".claude" / "agents-usage.json"
+CONFIG_PATHS = (
+    Path.home() / ".claude" / "agents-usage.json",
+    Path.home() / ".codex" / "agents-usage.json",
+)
+"""Where the url and token live — ONE file serves both reporters, because the
+credential belongs to the platform and not to a CLI. This is the fallback ORDER; each
+reporter puts its own CLI's directory in front of it (see `config_paths`), and
+`AGENTS_USAGE_CONFIG` in front of that. `~/.claude` leads the fallback because it is
+where every copy installed so far already wrote one."""
 
 DEFAULT_ENTRYPOINTS = ("cli",)
 """Transcript origins worth reporting — see trap 2. Widen with AGENTS_USAGE_ENTRYPOINTS."""
@@ -70,22 +89,47 @@ def log(message: str) -> None:
     if os.environ.get("AGENTS_USAGE_DEBUG") != "1":
         return
     try:
-        path = Path.home() / ".claude" / "agents-usage.log"
-        with path.open("a", encoding="utf-8") as fh:
+        with log_path().open("a", encoding="utf-8") as fh:
             fh.write(f"{message}\n")
     except OSError:
         pass
 
 
-def load_config() -> dict:
+def log_path() -> Path:
+    """Beside the config, so a Codex-only machine does not log into a `~/.claude` it
+    has no other reason to own. Unchanged where Claude Code is installed."""
+    for candidate in config_paths():
+        if candidate.parent.is_dir():
+            return candidate.parent / "agents-usage.log"
+    return Path.home() / "agents-usage.log"
+
+
+def config_paths(preferred=None) -> tuple:
+    """
+    The candidates in order: `AGENTS_USAGE_CONFIG`, then the caller's OWN directory,
+    then the rest. Each reporter puts its own CLI's directory first so that installing
+    Codex on a machine that already carries a stale `~/.claude/agents-usage.json`
+    points at the token just written rather than silently at the old one. Repeats in
+    the list are harmless — the first readable file wins.
+    """
+    named = os.environ.get("AGENTS_USAGE_CONFIG", "").strip()
+    ordered = (Path(named),) if named else ()
+    if preferred:
+        ordered += (Path(preferred),)
+    return ordered + CONFIG_PATHS
+
+
+def load_config(preferred=None) -> dict:
     """Env wins over the file, so one session can be pointed elsewhere for a test."""
     config = {}
-    try:
-        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(config, dict):
-            config = {}
-    except (OSError, ValueError):
-        pass
+    for path in config_paths(preferred):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(loaded, dict):
+            config = loaded
+            break
 
     url = (os.environ.get("AGENTS_USAGE_URL") or config.get("url") or "").strip()
     token = (os.environ.get("AGENTS_USAGE_TOKEN") or config.get("token") or "").strip()
@@ -249,20 +293,42 @@ def path_label(cwd: str) -> str:
     return "~" if relative == "." else relative
 
 
-def device_of(config: dict) -> str:
-    """
-    Which MACHINE reported, so quota can be split per device.
+MAX_DEVICE = 64
+"""Longest label sent. The server caps it too; this keeps a pathological hostname from
+making the payload strange in the first place."""
 
-    A LABEL only: multi-device accounting is already correct without it, because the
-    upsert key carries a session UUID that no two machines can collide on.
 
-    Claude Code keeps its own `machineID` in ~/.claude.json — stable per machine and
-    opaque, so it names a device without carrying its hostname. A `device` in the config
-    wins, because a human reading the ledger wants "dev-pc", not 12 hex characters.
+def user_host() -> str:
     """
-    named = str(config.get("device") or "").strip()
-    if named:
-        return named
+    This machine as its own shell names it: `user@host`.
+
+    The SHORT hostname, not the FQDN — `dev-pc` is what a human calls the box, and the
+    domain that follows only records which network it was on when it reported. Either
+    half is dropped when the box will not say (a container with no passwd entry, a host
+    with no name): half a label still names something, and an empty one names nothing.
+    """
+    try:
+        user = getpass.getuser().strip()
+    except Exception:  # no passwd entry AND no USER in the environment
+        user = ""
+    try:
+        host = socket.gethostname().strip().split(".")[0]
+    except OSError:
+        host = ""
+    if user and host:
+        return f"{user}@{host}"
+    return host or user
+
+
+def machine_id() -> str:
+    """
+    Claude Code's own `machineID` from ~/.claude.json — stable per machine and opaque.
+
+    No longer the default, and no longer OURS to depend on: it named a device only to
+    whoever could look the id up, and only on a machine where Claude Code is installed.
+    It survives as `device_id`'s last resort, for the box that can name neither its user
+    nor its host AND cannot persist an id of its own.
+    """
     directory = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     candidates = [Path(directory) / ".claude.json"] if directory else []
     candidates.append(Path.home() / ".claude.json")
@@ -274,6 +340,244 @@ def device_of(config: dict) -> str:
         if machine:
             return machine[:12]
     return ""
+
+
+def device_of(config: dict) -> str:
+    """
+    Which MACHINE reported, so quota can be split per device.
+
+    A LABEL only: multi-device accounting is already correct without it, because the
+    upsert key carries a session UUID that no two machines can collide on. What it
+    decides is whether the person reading /usage can tell which box a row came from.
+
+    In order: the name this machine was GIVEN (`--set-device`, `device` in the config,
+    or `AGENTS_USAGE_DEVICE`), then `user@host`, then this machine's own `device_id`
+    for a box that will name neither. BOTH reporters call this one function, so one
+    laptop stays one row on the breakdown whichever CLI spent the quota.
+
+    `user@host` is the default deliberately, in place of the machineID this used to
+    send: it carries this machine's login and hostname, which is the point — a fleet's
+    rows are read by the person who owns the fleet, and `dev-pc` is worth more to them
+    than 12 hex characters. Name the machine to send something else instead.
+    """
+    named = str(config.get("device") or "").strip()
+    if named:
+        return named[:MAX_DEVICE]
+    return (user_host() or device_id())[:MAX_DEVICE]
+
+
+def device_id() -> str:
+    """
+    This machine's own id — OURS, not a harness's, and the DEVICE's, not a login's.
+
+    Every CLI already keeps an id for its own machine (Claude Code's `machineID`,
+    Codex's `installation_id`), and each names the same laptop differently, so a
+    reporter that borrowed one would name the box differently per harness — and would
+    have nothing at all to read on a harness that keeps none.
+
+    It follows the DEVICE on purpose. Who spent the quota is already a field of its
+    own (`accountId`), so the only question this one answers is *which box*, and an id
+    that changed per login would answer a question nothing asked while splitting one
+    laptop across the breakdown. Two people sharing a workstation report the same
+    device and stay apart by their account; the default `user@host` label is the view
+    that separates them by hand.
+
+    Resolved in three ways, in order:
+
+    1. An id already stored in a config, scanned in a FIXED order (`id_paths`, never
+       the caller's preferred-first order) — two reporters resolving the same set of
+       files must land on the same id, or the machine splits in two. This comes first
+       so a box that has already reported keeps the identity it reported under.
+    2. DERIVED from the operating system's own machine id — `/etc/machine-id`, macOS's
+       IOPlatformUUID, Windows' MachineGuid. That is what survives the two things a
+       stored id does not: the config file being deleted (the next install re-derives
+       the SAME id rather than inventing a new device) and a second OS user on the box
+       (who derives it too, instead of appearing as another machine).
+    3. A random id, persisted. Only for a box whose OS will not name itself.
+
+    The OS id is HASHED with an app-specific salt, never sent raw: it is a stable
+    identifier for the whole machine, systemd documents that applications must derive
+    from it rather than expose it, and a value we would not want a server to see is a
+    value we should not put in a payload.
+
+    A RANDOM id that cannot be persisted is worse than none — every session would
+    generate its own and each would read as a separate device — so that path falls
+    back to the harness id instead. A derived one needs no file to stay stable, which
+    is exactly why it is preferred; it is still stored, best-effort, so an OS that
+    later changes its own id (a re-image, a cloned VM) does not rename the box.
+    """
+    for path in id_paths():
+        try:
+            value = str(json.loads(path.read_text(encoding="utf-8")).get("deviceId") or "").strip()
+        except (OSError, ValueError):
+            continue
+        if value:
+            return value[:MAX_DEVICE]
+
+    seed = machine_seed()
+    if seed:
+        derived = hashlib.sha256(f"agents-usage:{seed}".encode("utf-8")).hexdigest()[:12]
+        update_config({"deviceId": derived})
+        return derived
+
+    fresh = uuid.uuid4().hex[:12]
+    return fresh if update_config({"deviceId": fresh}) else machine_id()
+
+
+MACHINE_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+"""Linux's own id for the box. The dbus copy is the fallback on systems that predate
+systemd or keep only that one; both hold the same value where both exist."""
+
+
+def machine_seed() -> str:
+    """
+    What the OPERATING SYSTEM calls this machine — raw, and never sent anywhere: it is
+    hashed before it becomes an id (see `device_id`).
+
+    One source per platform, cheapest first. Linux and Windows answer from a file and
+    the registry; macOS keeps its IOPlatformUUID nowhere a file can reach it, so that
+    one costs a subprocess — which is affordable HERE and nowhere else in this script,
+    because the result is written to the config on the first call and every later
+    session reads it back instead.
+
+    Returns "" for a box that will not say, which is a normal answer: a container has
+    no stable identity of its own, and inventing one from its hostname would give
+    every rebuild of it a new device.
+    """
+    for path in MACHINE_ID_FILES:
+        try:
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        found = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+        if found:
+            return found.group(1)
+
+    if os.name == "nt":
+        try:
+            import winreg  # noqa: PLC0415  (Windows-only, and only on this path)
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                return str(winreg.QueryValueEx(key, "MachineGuid")[0]).strip()
+        except (ImportError, OSError):
+            pass
+
+    return ""
+
+
+def id_paths() -> tuple:
+    """Where a `deviceId` may live, in the order every reporter must agree on."""
+    named = os.environ.get("AGENTS_USAGE_CONFIG", "").strip()
+    return ((Path(named),) if named else ()) + CONFIG_PATHS
+
+
+def config_target(preferred=None) -> Path:
+    """
+    Which config file a WRITE lands in: `AGENTS_USAGE_CONFIG` when it names one at all
+    (an explicit path is a decision, whether or not the file exists yet), else the
+    first that already exists in the read order — so naming a machine changes the file
+    the reporter actually reads — else the caller's own directory.
+    """
+    named = os.environ.get("AGENTS_USAGE_CONFIG", "").strip()
+    if named:
+        return Path(named)
+    for candidate in config_paths(preferred):
+        if candidate.is_file():
+            return candidate
+    return Path(preferred) if preferred else CONFIG_PATHS[0]
+
+
+def update_config(changes: dict, preferred=None):
+    """
+    Merge `changes` into the config and write it back; a `None` value removes its key.
+    Returns the path written, or None when the box would not take it.
+
+    Read-modify-write, 0600, temp-and-rename — the same care the installer takes with
+    this file, for the same two reasons: it holds the API token, so it must never exist
+    for an instant in a mode the rest of the machine can read, and a write that dropped
+    `url` or `token` would silently stop every report from this box.
+    """
+    target = config_target(preferred)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            config = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        for key, value in changes.items():
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
+        handle, temporary = tempfile.mkstemp(dir=str(target.parent), prefix=".agents-usage-")
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            json.dump(config, fh, indent=2)
+            fh.write("\n")
+        os.replace(temporary, target)
+    except OSError as err:
+        log(f"config write failed: {err!r}")
+        return None
+    return target
+
+
+def set_device(name: str, preferred=None) -> int:
+    """
+    Name this machine, or with an empty name give it back its derived one.
+
+    `--id` asks for the opaque id instead of a name — the escape hatch for a box that
+    must not report its login and hostname, and the one value that is stable across
+    every harness on it.
+    """
+    name = name.strip()
+    if name == "--id":
+        name = device_id()
+        if not name:
+            print("no device id could be stored — is the config directory writable?", file=sys.stderr)
+            return 1
+    target = update_config({"device": name[:MAX_DEVICE] or None}, preferred)
+    if target is None:
+        print(f"could not write {config_target(preferred)}", file=sys.stderr)
+        return 1
+    print(f"device = {device_of(load_config(preferred)) or '(none)'}  [{target}]")
+    override = os.environ.get("AGENTS_USAGE_DEVICE", "").strip()
+    if override:
+        print(f"note: AGENTS_USAGE_DEVICE={override} is set and wins over the file", file=sys.stderr)
+    return 0
+
+
+def device_command(argv: list, preferred=None) -> int:
+    """
+    `--set-device [NAME]`, shared by both reporters.
+
+    With a name it names the machine; with `--id` it uses this machine's own opaque id
+    instead; with an EMPTY name (`--set-device ''`) it clears the name and goes back to
+    `user@host`; with no argument at all it only says what the label is now. That last
+    case is the reason the argument is optional: a flag that could only ever write
+    would clear the name of whoever typed it to look.
+    """
+    index = argv.index("--set-device")
+    if len(argv) > index + 1:
+        return set_device(argv[index + 1], preferred)
+    print(f"device = {device_of(load_config(preferred)) or '(none)'}")
+    print("--set-device NAME names it · --set-device --id uses the opaque id "
+          "· --set-device '' goes back to user@host")
+    return 0
 
 
 REDIRECT_VARS = (
@@ -477,21 +781,41 @@ def session_id_of(payload: dict, transcript: Path) -> str:
     return transcript.stem
 
 
-def report(config: dict, session: str, models: dict, cwd: str) -> bool:
+def body_of(config: dict, session: str, models: dict, cwd: str) -> dict:
+    """
+    The wire shape of one report — built in ONE place so `--print` cannot drift from
+    what is actually sent, which is the only way to check this without a server.
+
+    `provider` names WHICH CLI spent the quota. A server older than 0.7.0 ignores the
+    field and files the row as `claude-cli`, which is what every row from here has
+    always been, so sending it costs an old deploy nothing.
+    """
     backend = backend_of()
-    body = json.dumps({
+    return {
         "sessionId": session,
+        "provider": "claude-cli",
         "accountId": claude_account_id(),
         "project": project_of(cwd),
         "device": device_of(config),
         "backend": backend[0],
         "baseUrl": backend[1],
         "models": [{"model": model, **totals} for model, totals in sorted(models.items())],
-    }).encode("utf-8")
+    }
 
+
+def post(config: dict, body: dict, user_agent: str = USER_AGENT) -> bool:
+    """
+    POST one report to the ledger.
+
+    Shared with the Codex reporter: the endpoint, the timeout, the failure handling
+    and the User-Agent are properties of the PLATFORM, not of the CLI being reported
+    on, and a second copy of them is a second place for the WAF lesson below to be
+    forgotten.
+    """
+    session = body.get("sessionId")
     request = urllib.request.Request(
         f"{config['url']}/api/v1/usage/sessions",
-        data=body,
+        data=json.dumps(body).encode("utf-8"),
         method="POST",
         headers={
             "content-type": "application/json",
@@ -499,7 +823,7 @@ def report(config: dict, session: str, models: dict, cwd: str) -> bool:
             # Named on purpose. urllib's default UA is `Python-urllib/3.x`, which a WAF
             # in front of the platform rejects outright (Cloudflare error 1010) — the
             # report came back 403 with nothing in it that looked like an auth problem.
-            "user-agent": USER_AGENT,
+            "user-agent": user_agent,
         },
     )
     try:
@@ -537,6 +861,8 @@ def transcripts_of(payload: dict, argv: list[str]) -> list[Path]:
 
 def main() -> int:
     argv = sys.argv[1:]
+    if "--set-device" in argv:
+        return device_command(argv)
     dry_run = "--print" in argv
 
     payload = {}
@@ -564,20 +890,11 @@ def main() -> int:
             log(f"{transcript.name}: skipped {skipped} record(s) from another entrypoint")
         if not models:
             continue
-        session = session_id_of(payload, transcript)
+        body = body_of(config, session_id_of(payload, transcript), models, cwd)
         if dry_run:
-            backend = backend_of()
-            print(json.dumps({
-                "sessionId": session,
-                "accountId": claude_account_id(),
-                "project": project_of(cwd),
-                "device": device_of(config),
-                "backend": backend[0],
-                "baseUrl": backend[1],
-                "models": [{"model": m, **t} for m, t in sorted(models.items())],
-            }, indent=2))
+            print(json.dumps(body, indent=2))
             continue
-        report(config, session, models, cwd)
+        post(config, body)
 
     return 0
 
