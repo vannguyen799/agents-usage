@@ -197,24 +197,31 @@ def device_of(config: dict) -> str:
     return ""
 
 
-def subagent_transcripts(transcript: Path) -> list[Path]:
+def nested_transcripts(transcript: Path) -> list[Path]:
     """
-    The sub-sessions the Task tool ran inside this one.
+    Every transcript written UNDER the session's own directory: the sub-sessions the Task
+    tool spawned (`<session-id>/subagents/agent-*.jsonl`) and the agents a workflow ran
+    (`<session-id>/subagents/workflows/wf_*/agent-*.jsonl`, two levels deeper again).
 
-    Claude Code writes them BESIDE the session rather than into it — as
-    `<project>/<session-id>/subagents/agent-*.jsonl` — and what they spent appears
-    nowhere in the parent: of 15,567 subagent responses written here over a month,
-    exactly one shared a `message.id` with a parent transcript. Reading only
-    `<project>/<session>.jsonl` therefore silently drops every token a subagent spent —
-    2.65B of 16.7B on this machine, 16% of the real total.
+    Claude Code writes all of it beside the session rather than into it, and what those
+    agents spent reaches the parent transcript nowhere: of 15,567 subagent responses
+    written here over a month, exactly one shared a `message.id` with its parent. Reading
+    only `<project>/<session>.jsonl` therefore drops that spend in silence — 2.70B tokens
+    of 16.6B on this machine, 16% of the real total.
+
+    Swept recursively rather than by naming the two layouts, because the directory is the
+    contract: anything under a session id was spent BY that session, and a third nesting
+    level would otherwise go missing exactly as quietly as the first two did. Non-transcript
+    files that live there (a workflow's `journal.jsonl`) carry no assistant record with a
+    `usage` block and fall out of the tally on their own.
 
     They fold into the session that spawned them rather than reporting as sessions of
     their own: the directory IS the parent's id, an agent id is not a session id the
     platform could resolve, and one row per session keeps the upsert key stable.
     """
-    directory = transcript.parent / transcript.stem / "subagents"
+    directory = transcript.parent / transcript.stem
     try:
-        return sorted(p for p in directory.glob("*.jsonl") if p.is_file())
+        return sorted(p for p in directory.rglob("*.jsonl") if p.is_file())
     except OSError:
         return []
 
@@ -242,7 +249,7 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
 
     # Parent first: it is the session's own record of where it ran, and a subagent
     # inherits that directory rather than defining it.
-    for path in [transcript, *subagent_transcripts(transcript)]:
+    for path in [transcript, *nested_transcripts(transcript)]:
         try:
             handle = path.open(encoding="utf-8", errors="replace")
         except OSError:

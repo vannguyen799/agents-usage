@@ -14,12 +14,14 @@ Two hooks (`Stop`, `SessionEnd`) run one script. It re-reads the session transcr
 sums tokens per model, and POSTs the **cumulative** total to
 `POST /api/v1/usage/sessions`. The server upserts on `cli:<sessionId>:<model>`.
 
-**Subagents count too.** Claude Code writes what the Task tool spawns beside the session
-rather than into it — `<project>/<session-id>/subagents/agent-*.jsonl` — and none of it
-reaches the parent transcript, so reading the session file alone drops that spend
-entirely: measured here, 2.70B tokens over 30 days, 16% of the real total. Those files
-are read with the session and fold into its report, because the directory is the parent's
-id and a subagent is not a session the platform could resolve.
+**Subagents and workflow agents count too.** Claude Code writes what the Task tool
+spawns beside the session rather than into it — `<project>/<session-id>/subagents/` for
+subagents, another two levels down under `subagents/workflows/wf_*/` for the agents a
+workflow runs — and none of it reaches the parent transcript, so reading the session
+file alone drops that spend entirely: measured here, 2.87B tokens over 30 days, 17% of
+the real total. Everything under the session's directory is swept recursively and folds
+into its report, because the directory is the contract — anything filed under a session
+id was spent by that session, including a nesting level that does not exist yet.
 
 Cumulative + upsert is the whole design. Hooks fire an unpredictable number of times,
 are retried, and can miss a turn entirely; sending totals-so-far means the row converges
