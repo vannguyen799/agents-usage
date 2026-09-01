@@ -1,0 +1,65 @@
+# The version IS the update signal.
+#
+# Claude Code refreshes an installed plugin by comparing plugin.json's `version`.
+# A changed script under an unchanged version reaches nobody: the cache has no
+# reason to refresh, so every machine keeps running the old copy and says nothing.
+#
+# That is not hypothetical here. 0.1.0 shipped three behaviour changes this way —
+# project/device attribution, the User-Agent that gets past a WAF, and the
+# recursive transcript sweep — and one workstation ran the pre-User-Agent script
+# for a week while every report bounced off Cloudflare with 403 error 1010,
+# swallowed by a hook whose whole design is to never disturb a session.
+name: release hygiene
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: plugin.json and marketplace.json must agree
+        run: |
+          set -euo pipefail
+          plugin=$(jq -r '.version' .claude-plugin/plugin.json)
+          market=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
+          echo "plugin.json=$plugin  marketplace.json=$market"
+          if [ "$plugin" != "$market" ]; then
+            echo "::error::version mismatch — plugin.json says $plugin, marketplace.json says $market"
+            exit 1
+          fi
+
+      - name: a change under scripts/ or hooks/ must bump the version
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          # A brand-new branch reports an all-zero "before" and has nothing to diff.
+          case "$BASE" in
+            ''|0000000000000000000000000000000000000000)
+              echo "no base commit to compare against — skipping"; exit 0 ;;
+          esac
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "base $BASE not in this clone — skipping"; exit 0
+          fi
+
+          changed=$(git diff --name-only "$BASE" HEAD -- scripts hooks)
+          if [ -z "$changed" ]; then
+            echo "no script or hook change in this range — nothing to enforce"; exit 0
+          fi
+          echo "changed:"; echo "$changed" | sed 's/^/  /'
+
+          before=$(git show "$BASE:.claude-plugin/plugin.json" | jq -r '.version')
+          after=$(jq -r '.version' .claude-plugin/plugin.json)
+          echo "version $before -> $after"
+          if [ "$before" = "$after" ]; then
+            echo "::error::scripts/ or hooks/ changed but plugin.json is still $after."
+            echo "::error::Installed copies refresh by VERSION, so this change would reach no one. Bump it."
+            exit 1
+          fi
