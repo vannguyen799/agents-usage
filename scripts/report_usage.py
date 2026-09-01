@@ -43,11 +43,12 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
-USER_AGENT = "agents-usage/0.5.0 (claude-code-hook)"
+USER_AGENT = "agents-usage/0.6.0 (claude-code-hook)"
 """Sent on every report, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -279,33 +280,57 @@ REDIRECT_VARS = (
     ("CLAUDE_CODE_USE_BEDROCK", "bedrock"),
     ("CLAUDE_CODE_USE_VERTEX", "vertex"),
     ("CLAUDE_CODE_USE_FOUNDRY", "foundry"),
+    ("CLAUDE_CODE_USE_GATEWAY", "gateway"),
+    ("CLAUDE_CODE_USE_MANTLE", "mantle"),
+    ("CLAUDE_CODE_USE_ANTHROPIC_AWS", "anthropicAws"),
+    ("CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "anthropicGoogleCloud"),
 )
-"""Env flags that point Claude Code at a partner-operated backend."""
+"""Env flags that point Claude Code at a partner-operated backend. Names read out of
+the shipped CLI binary rather than recalled."""
+
+BASE_URL_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_HOST", "CLAUDE_CODE_API_BASE_URL")
 
 
-def backend_of() -> str:
+def backend_of() -> tuple[str, str]:
     """
-    WHICH ENDPOINT this session was talking to.
+    WHICH ENDPOINT this session was talking to, as (name, base url).
 
-    The transcript records none -- scanned across 4001 assistant records, no field
-    names a backend -- so it is read from the environment instead. That works here and
-    nowhere else: this hook runs INSIDE the session it reports on, so its own
-    environment is that session's.
+    The transcript names none -- scanned across 4001 assistant records, no field does
+    -- so it is read from the environment. That works here and nowhere else: this hook
+    runs INSIDE the session it reports on, so its own environment is that session's.
 
-    It matters because the server WEIGHTS these tokens, and the weights are Anthropic's
-    ratios. Bedrock, Vertex and Foundry are partner-operated with their own pricing, so
-    a redirected session is weighed on a tariff it was never billed at -- silently,
-    because the numbers still look ordinary. Naming the endpoint does not fix the
-    weighting; it ends the silence.
+    It matters because the server WEIGHTS these tokens on Anthropic's ratios, and the
+    partner backends are separately priced. The server decides what to do with a
+    session that was not served natively; this only has to report honestly enough for
+    that decision to be possible, which is why the URL goes along with the name -- a
+    name alone cannot be checked.
 
-    `ANTHROPIC_BASE_URL` is reported as the bare word `custom` and never as its value:
-    a base URL can carry a hostname, a port, a path and occasionally a token, and none
-    of that belongs in a label sent off the machine.
+    THE URL IS SANITISED, not passed through. `https://user:ghp_x@host/v1?token=abc`
+    is an ordinary thing to find in an environment, and this value is sent off the
+    machine. Only scheme, host, port and path survive; the userinfo (where a secret
+    lives) and the query and fragment (where the other one does) are dropped by
+    construction rather than by a pattern that must first recognise a secret.
     """
     for var, name in REDIRECT_VARS:
         if os.environ.get(var, "").strip() not in ("", "0", "false", "False"):
-            return name
-    return "custom" if os.environ.get("ANTHROPIC_BASE_URL", "").strip() else "firstParty"
+            return name, ""
+    for var in BASE_URL_VARS:
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            return "custom", safe_url(raw)
+    return "firstParty", ""
+
+
+def safe_url(raw: str) -> str:
+    """Scheme, host, port and path of a URL -- never its userinfo, query or fragment."""
+    try:
+        u = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ""
+    if not u.hostname:
+        return ""
+    host = u.hostname + (f":{u.port}" if u.port else "")
+    return f"{u.scheme or 'https'}://{host}{u.path.rstrip('/')}"[:200]
 
 
 def nested_transcripts(transcript: Path) -> list[Path]:
@@ -453,12 +478,14 @@ def session_id_of(payload: dict, transcript: Path) -> str:
 
 
 def report(config: dict, session: str, models: dict, cwd: str) -> bool:
+    backend = backend_of()
     body = json.dumps({
         "sessionId": session,
         "accountId": claude_account_id(),
         "project": project_of(cwd),
         "device": device_of(config),
-        "backend": backend_of(),
+        "backend": backend[0],
+        "baseUrl": backend[1],
         "models": [{"model": model, **totals} for model, totals in sorted(models.items())],
     }).encode("utf-8")
 
@@ -539,12 +566,14 @@ def main() -> int:
             continue
         session = session_id_of(payload, transcript)
         if dry_run:
+            backend = backend_of()
             print(json.dumps({
                 "sessionId": session,
                 "accountId": claude_account_id(),
                 "project": project_of(cwd),
                 "device": device_of(config),
-                "backend": backend_of(),
+                "backend": backend[0],
+                "baseUrl": backend[1],
                 "models": [{"model": m, **t} for m, t in sorted(models.items())],
             }, indent=2))
             continue
