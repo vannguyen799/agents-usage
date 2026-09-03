@@ -13,8 +13,14 @@
 # existing config is edited rather than replaced — so answering "keep" to the
 # token question leaves the one already on disk untouched.
 #
-# Non-interactive (CI, a fleet script):
+# Non-interactive (CI, a fleet script), from a clone or straight off the web:
 #   install.sh --platform both --url https://… --token aur_… --device dev-pc --yes
+#   curl -fsSL https://raw.githubusercontent.com/vannguyen799/agents-usage/refs/heads/main/scripts/install.sh \
+#     | sh -s -- --platform both --url https://… --token aur_… --yes
+#
+# Piped there is no terminal to ask into, so every answer must arrive as a flag —
+# `--url` and `--token` above all, since an installer that reached the end with no
+# key would leave a plugin that reports nothing and never says why.
 # ============================================================
 set -eu
 
@@ -105,6 +111,32 @@ ask_secret() {
 PY=""
 for candidate in python3 python; do have "$candidate" && { PY="$candidate"; break; }; done
 [ -n "$PY" ] || die "python3 is required — it is what the reporter itself runs on."
+
+# Where this script is running FROM — or nothing at all, which is the normal case
+# when it arrives down a pipe. `curl … | sh` leaves "$0" as the shell's own name, so
+# `dirname "$0"` is the CALLER's directory: `--source local` would hand the CLI some
+# unrelated tree to install, and the hints at the end would name a path that holds no
+# reporter. Resolve it once, prove it with a sibling only this repo has, and treat
+# "there is no directory" as a state to branch on rather than a path to guess at.
+SCRIPT_DIR=""
+if [ -n "${0:-}" ] && [ -f "$0" ]; then
+  _dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || _dir=""
+  [ -n "$_dir" ] && [ -f "$_dir/report_usage.py" ] && SCRIPT_DIR="$_dir"
+fi
+
+# The reporter this machine will actually run. Piped, the only copy is the one the
+# install just cloned, so look there too — each CLI keeps it in its own place.
+reporter_dir() {
+  for _candidate in \
+    "$SCRIPT_DIR" \
+    "$HOME/.claude/plugins/marketplaces/$MARKETPLACE/scripts" \
+    "$HOME/.codex/plugins/cache/$MARKETPLACE/$PLUGIN/scripts"
+  do
+    [ -n "$_candidate" ] && [ -f "$_candidate/report_usage.py" ] \
+      && { printf '%s' "$_candidate"; return 0; }
+  done
+  return 1
+}
 
 # ------------------------------------------------------------
 # 1. which CLI
@@ -232,17 +264,15 @@ os.replace(temporary, path)
 print(f"   url={url}  token={'kept' if token == keep else 'set'}")
 PY
 
-# What this machine will actually be CALLED on /usage — derived here rather than
-# guessed at, and printed with the command that changes it later.
-AGENTS_USAGE_CONFIG="$CONFIG" "$PY" "$(dirname "$0")/report_usage.py" --set-device 2>/dev/null | sed 's/^/   /'
-
 # ------------------------------------------------------------
 # 4. install, with updates left switched on
 # ------------------------------------------------------------
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 case "$SOURCE" in
   github) CLAUDE_SOURCE="$GITHUB_REPO"; CODEX_SOURCE="$GITHUB_REPO" ;;
-  local)  CLAUDE_SOURCE="$REPO_ROOT";   CODEX_SOURCE="$REPO_ROOT" ;;
+  local)
+    [ -n "$SCRIPT_DIR" ] || die "--source local needs this repo on disk, and this script is being piped — clone it and run scripts/install.sh, or drop the flag."
+    REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+    CLAUDE_SOURCE="$REPO_ROOT"; CODEX_SOURCE="$REPO_ROOT" ;;
   *) die "--source must be github or local." ;;
 esac
 
@@ -311,12 +341,21 @@ fi
 
 # ------------------------------------------------------------
 step "Done"
+
+# What this machine will be CALLED on /usage — read back from the reporter that was
+# just installed rather than guessed at here, so the label printed is the label sent.
+REPORTER=$(reporter_dir) || REPORTER=""
+[ -n "$REPORTER" ] && AGENTS_USAGE_CONFIG="$CONFIG" \
+  "$PY" "$REPORTER/report_usage.py" --set-device 2>/dev/null | sed 's/^/   /'
+
 say "Restart the CLI you installed into — hooks are read at startup."
 [ "$WANT_CODEX" = 1 ] && say "Codex asks once to TRUST this plugin's hooks; until you do, nothing is reported."
 say ""
 say "Check it: AGENTS_USAGE_DEBUG=1 in the environment writes every attempt to"
 say "  $(dirname "$CONFIG")/agents-usage.log"
-say "Catch up sessions that ended without a hook (safe to re-run, the report is cumulative):"
-[ "$WANT_CLAUDE" = 1 ] && say "  $REPO_ROOT/scripts/report-usage.sh --backfill 7"
-[ "$WANT_CODEX"  = 1 ] && say "  $REPO_ROOT/scripts/report-codex-usage.sh --backfill 7"
+if [ -n "$REPORTER" ]; then
+  say "Catch up sessions that ended without a hook (safe to re-run, the report is cumulative):"
+  [ "$WANT_CLAUDE" = 1 ] && say "  $REPORTER/report-usage.sh --backfill 7"
+  [ "$WANT_CODEX"  = 1 ] && say "  $REPORTER/report-codex-usage.sh --backfill 7"
+fi
 exit 0
