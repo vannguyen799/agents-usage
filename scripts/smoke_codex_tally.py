@@ -20,6 +20,11 @@ import report_codex_usage as reporter  # noqa: E402
 
 FAILURES = []
 
+HOUR = "2026-08-28T04"
+"""The hour every event below lands in unless it says otherwise. A tally is keyed by
+(model, hour) since 0.8.0 — a session is a span, and one row for all of it can only be
+charted as a flat smear over every hour it was open."""
+
 
 def check(name: str, got, want) -> None:
     if got == want:
@@ -45,9 +50,13 @@ def turn(model: str) -> dict:
     return {"type": "turn_context", "payload": {"model": model}}
 
 
-def tokens(input_tokens: int, cached: int, output: int, reasoning: int = 0) -> dict:
-    """One `token_count` event, carrying the session's CUMULATIVE totals."""
-    return {"type": "event_msg", "payload": {"type": "token_count", "info": {
+def tokens(input_tokens: int, cached: int, output: int, reasoning: int = 0,
+           at: str = f"{HOUR}:10:00.000Z") -> dict:
+    """One `token_count` event, carrying the session's CUMULATIVE totals.
+
+    `at` is the stamp the rollout writes against it, and the hour of that stamp is what
+    the delta is filed under. Passing `None` is a record with no usable stamp."""
+    record = {"type": "event_msg", "payload": {"type": "token_count", "info": {
         "total_token_usage": {
             "input_tokens": input_tokens,
             "cached_input_tokens": cached,
@@ -58,6 +67,9 @@ def tokens(input_tokens: int, cached: int, output: int, reasoning: int = 0) -> d
         },
         "last_token_usage": {},
     }}}
+    if at is not None:
+        record["timestamp"] = at
+    return record
 
 
 def tally(records: list, accepted=("codex-tui",)) -> dict:
@@ -68,7 +80,16 @@ def tally(records: list, accepted=("codex-tui",)) -> dict:
 
 
 def models_of(session: dict) -> dict:
-    return session.get("models", {})
+    """Every tally, keyed by (model, hour), with the span stripped off — the counts are
+    what most cases here are about, and `startedAt` has its own section."""
+    return {
+        key: {k: v for k, v in totals.items() if k not in ("startedAt", "endedAt")}
+        for key, totals in session.get("models", {}).items()
+    }
+
+
+def counts_of(session: dict, model: str = "gpt-5.6-terra", hour: str = HOUR) -> dict:
+    return models_of(session)[(model, hour)]
 
 
 print("cumulative totals become deltas")
@@ -79,11 +100,11 @@ session = tally([
     tokens(900, 700, 30),
     tokens(1500, 1200, 60),
 ])
-check("summed once, not once per turn", models_of(session), {"gpt-5.6-terra": {
+check("summed once, not once per turn", models_of(session), {("gpt-5.6-terra", HOUR): {
     "promptTokens": 300, "completionTokens": 60, "cacheReadTokens": 1200, "calls": 3,
 }})
 check("and the deltas add back up to the last reading",
-      sum(models_of(session)["gpt-5.6-terra"][k] for k in ("promptTokens", "cacheReadTokens")),
+      sum(counts_of(session)[k] for k in ("promptTokens", "cacheReadTokens")),
       1500)
 
 # A restart is the TOTAL going backwards. One class dipping while the total rises is
@@ -93,27 +114,26 @@ session = tally([
     tokens(1000, 400, 100),
     tokens(1400, 900, 200),   # uncached input dips 600 -> 500, the total still climbs
 ])
-check("a single class dipping is not a restart",
-      models_of(session)["gpt-5.6-terra"]["cacheReadTokens"], 900)
+check("a single class dipping is not a restart", counts_of(session)["cacheReadTokens"], 900)
 check("…and the dip contributes nothing rather than everything",
-      models_of(session)["gpt-5.6-terra"]["promptTokens"], 600)
+      counts_of(session)["promptTokens"], 600)
 
 print("\nthe cached prefix is not uncached input")
 session = tally([meta(), turn("gpt-5.6-terra"), tokens(1_000_000, 990_000, 100)])
-check("input minus cached", models_of(session)["gpt-5.6-terra"]["promptTokens"], 10_000)
-check("cached reported apart", models_of(session)["gpt-5.6-terra"]["cacheReadTokens"], 990_000)
+check("input minus cached", counts_of(session)["promptTokens"], 10_000)
+check("cached reported apart", counts_of(session)["cacheReadTokens"], 990_000)
 
 print("\nreasoning is inside output, not beside it")
 session = tally([meta(), turn("gpt-5.6-terra"), tokens(100, 0, 500, reasoning=400)])
-check("output not doubled", models_of(session)["gpt-5.6-terra"]["completionTokens"], 500)
+check("output not doubled", counts_of(session)["completionTokens"], 500)
 
 print("\na repeated event spends nothing")
 session = tally([
     meta(), turn("gpt-5.6-terra"),
     tokens(500, 100, 20), tokens(500, 100, 20), tokens(500, 100, 20),
 ])
-check("identical totals fold into one call", models_of(session)["gpt-5.6-terra"]["calls"], 1)
-check("and add nothing", models_of(session)["gpt-5.6-terra"]["promptTokens"], 400)
+check("identical totals fold into one call", counts_of(session)["calls"], 1)
+check("and add nothing", counts_of(session)["promptTokens"], 400)
 
 print("\na model change splits the session")
 session = tally([
@@ -121,8 +141,10 @@ session = tally([
     turn("gpt-5.6-sol"), tokens(1000, 0, 100),
 ])
 check("each model keeps its own share", models_of(session), {
-    "gpt-5.6-terra": {"promptTokens": 400, "completionTokens": 40, "cacheReadTokens": 0, "calls": 1},
-    "gpt-5.6-sol": {"promptTokens": 600, "completionTokens": 60, "cacheReadTokens": 0, "calls": 1},
+    ("gpt-5.6-terra", HOUR): {
+        "promptTokens": 400, "completionTokens": 40, "cacheReadTokens": 0, "calls": 1},
+    ("gpt-5.6-sol", HOUR): {
+        "promptTokens": 600, "completionTokens": 60, "cacheReadTokens": 0, "calls": 1},
 })
 
 print("\ncompaction restarts the counter without erasing what was spent")
@@ -133,7 +155,7 @@ session = tally([
     tokens(2_000, 1_000, 100),   # a fresh count, NOT a decrease to be ignored
     tokens(3_000, 1_500, 150),
 ])
-check("pre- and post-compaction both counted", models_of(session)["gpt-5.6-terra"], {
+check("pre- and post-compaction both counted", counts_of(session), {
     "promptTokens": (10_000 - 9_000) + (2_000 - 1_000) + (1_000 - 500),
     "completionTokens": 500 + 100 + 50,
     "cacheReadTokens": 9_000 + 1_000 + 500,
@@ -151,8 +173,63 @@ print("\nspend nobody named a model for")
 check("dropped rather than filed under a guess",
       tally([meta(), tokens(500, 0, 50)]), {})
 session = tally([meta(), tokens(500, 0, 50), turn("gpt-5.6-terra"), tokens(800, 0, 80)])
-check("but kept when a later turn names one",
-      models_of(session)["gpt-5.6-terra"]["promptTokens"], 800)
+check("but kept when a later turn names one", counts_of(session)["promptTokens"], 800)
+session = tally([
+    meta(),
+    tokens(500, 0, 50, at=f"{HOUR}:10:00.000Z"),
+    tokens(900, 0, 90, at="2026-08-28T06:10:00.000Z"),
+    turn("gpt-5.6-terra"),
+])
+check("…each in the hour it was actually spent in, not all in the first",
+      {key: totals["promptTokens"] for key, totals in models_of(session).items()},
+      {("gpt-5.6-terra", HOUR): 500, ("gpt-5.6-terra", "2026-08-28T06"): 400})
+
+print("\nthe hour a delta was spent in")
+# The case the split exists for: one session, left running, spending in two hours.
+session = tally([
+    meta(), turn("gpt-5.6-terra"),
+    tokens(1_000, 0, 100, at=f"{HOUR}:05:00.000Z"),
+    tokens(1_000, 0, 100, at=f"{HOUR}:55:00.000Z"),   # a repeat: spends nothing
+    tokens(3_000, 0, 300, at="2026-08-28T05:30:00.000Z"),
+])
+check("a session spanning two hours is two tallies",
+      {key: totals["promptTokens"] for key, totals in models_of(session).items()},
+      {("gpt-5.6-terra", HOUR): 1_000, ("gpt-5.6-terra", "2026-08-28T05"): 2_000})
+check("the span is the events, not the whole hour",
+      (session["models"][("gpt-5.6-terra", HOUR)]["startedAt"],
+       session["models"][("gpt-5.6-terra", HOUR)]["endedAt"]),
+      (f"{HOUR}:05:00.000Z", f"{HOUR}:05:00.000Z"))
+
+print("\nstamps that cannot be read")
+session = tally([
+    meta(), turn("gpt-5.6-terra"),
+    tokens(1_000, 0, 100, at=f"{HOUR}:05:00.000Z"),
+    tokens(3_000, 0, 300, at="28/08/2026 05:30"),   # not ISO — unusable
+])
+check("an unreadable stamp inherits the hour before it, not a new bucket",
+      sorted(models_of(session)), [("gpt-5.6-terra", HOUR)])
+check("…and does not widen the span it was not part of",
+      session["models"][("gpt-5.6-terra", HOUR)]["endedAt"], f"{HOUR}:05:00.000Z")
+
+session = tally([
+    meta(), turn("gpt-5.6-terra"),
+    tokens(1_000, 0, 100, at=None), tokens(3_000, 0, 300, at=None),
+])
+check("a rollout with no stamp anywhere reports the pre-0.8.0 shape",
+      sorted(models_of(session)), [("gpt-5.6-terra", "")])
+check("…which the wire carries with no bucket at all",
+      [set(m) & {"bucket", "startedAt", "endedAt"} for m in reporter.wire_models(session["models"])],
+      [set()])
+
+session = tally([
+    meta(), turn("gpt-5.6-terra"),
+    tokens(1_000, 0, 100, at=None),                  # before any usable stamp
+    tokens(3_000, 0, 300, at="2026-08-28T05:30:00.000Z"),
+])
+check("spend before the first usable stamp joins the earliest hour there is",
+      sorted(models_of(session)), [("gpt-5.6-terra", "2026-08-28T05")])
+check("…keeping every token, not just the stamped ones",
+      counts_of(session, hour="2026-08-28T05")["promptTokens"], 3_000)
 
 print("\nthe project label")
 session = tally([meta(), turn("gpt-5.6-terra"), tokens(1, 0, 1)])

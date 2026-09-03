@@ -165,13 +165,52 @@ session would file every session as a separate device.
 ## How it works
 
 Two hooks (`Stop`, `SessionEnd`) in each CLI run one script. It re-reads the session
-transcript, sums tokens per model, and POSTs the **cumulative** total to
-`POST /api/v1/usage/sessions`. The server upserts on `cli:<sessionId>:<model>`.
+transcript, sums tokens per model **and hour**, and POSTs the **cumulative** total to
+`POST /api/v1/usage/sessions`. The server upserts on `cli:<sessionId>:<model>:<hour>`.
 
 Cumulative + upsert is the whole design. Hooks fire an unpredictable number of times,
 are retried, and can miss a turn entirely; sending totals-so-far means the row
 converges regardless, and neither side keeps a watermark that could be lost and
 re-counted.
+
+### The hour (0.8.0)
+
+A session is a **span**, not an instant. One left open all morning is a single session,
+and reported as a single row it can only be charted as an even smear across every hour
+it was alive — a flat line where the real spend was two bursts and a long idle. That is
+what /usage looked like before 0.8.0.
+
+Both transcripts already stamp every response, so nothing has to be measured — only
+kept. Each response is filed under the UTC hour of its own stamp, and a report carries
+one entry per (model, hour):
+
+```json
+{ "model": "claude-opus-5", "bucket": "2026-09-03T07:00:00Z",
+  "startedAt": "2026-09-03T07:05:17.365Z", "endedAt": "2026-09-03T07:59:35.661Z",
+  "promptTokens": 302, "completionTokens": 132322, "cacheReadTokens": 30891972,
+  "cacheWrite5mTokens": 0, "cacheWrite1hTokens": 267496, "calls": 151 }
+```
+
+`bucket` is half the upsert key, so the report stays idempotent at the finer
+resolution — re-reading the same transcript rewrites the same rows. `startedAt` /
+`endedAt` are the first and last response inside that hour, which is what a chart finer
+than an hour has to draw from; the server clamps them into the bucket rather than
+trusting a clock it does not run.
+
+UTC, deliberately: the hour is part of a key, so it has to mean the same thing on a
+laptop that travels. The /usage chart cuts its own buckets in the reader's zone, from
+the stamps, never from this.
+
+A record whose stamp cannot be read inherits the hour of the one before it — a
+transcript is only ever appended to. A transcript with no usable stamp **anywhere**
+sends no `bucket` at all and gets the pre-0.8.0 whole-session row, which every server
+still handles. What a report may never do is mix the two: that would write both a
+per-hour row and a whole-session row for one model, the same tokens twice, and the
+server refuses it.
+
+**Upgrading mid-session is handled.** A session live across the upgrade has a
+whole-session row from before it and per-hour rows from after — the first bucketed
+report deletes the old one, since the finer rows say everything it said.
 
 Rows land as `kind: cli`, `provider: claude-cli` or `codex-cli`, cost **$0**
 (subscription quota, not a bill), `conversationId` = the session id, and `accountId` =
@@ -336,8 +375,9 @@ scripts/report-codex-usage.sh --backfill 7    # Codex
 And the arithmetic itself, plus the way this machine names itself:
 
 ```bash
-python3 scripts/smoke_codex_tally.py
-python3 scripts/smoke_device.py
+python3 scripts/smoke_transcript_tally.py   # Claude Code: dedup, subagents, the hour
+python3 scripts/smoke_codex_tally.py        # Codex: deltas, compaction, the hour
+python3 scripts/smoke_device.py             # how this machine names itself
 ```
 
 ## Turning it off

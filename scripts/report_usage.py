@@ -53,7 +53,7 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 """The reporter's version, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -668,9 +668,15 @@ def nested_transcripts(transcript: Path) -> list[Path]:
 
 def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
     """
-    Cumulative tokens per model for one SESSION — its transcript plus every subagent
-    transcript it spawned — and the number of records skipped because they did not come
-    from an accepted entrypoint.
+    Cumulative tokens per (MODEL, HOUR) for one SESSION — its transcript plus every
+    subagent transcript it spawned — and the number of records skipped because they did
+    not come from an accepted entrypoint.
+
+    THE HOUR IS WHY THIS IS NOT KEYED BY MODEL ALONE. A session is a span: one left
+    open all morning is a single session, and reported as a single row it can only be
+    drawn spread evenly over every hour it was alive — a flat line where the truth was
+    three bursts and a long idle. Every record carries the stamp of the response it
+    holds, so the hour each one landed in is already known and only has to be kept.
 
     Deduplicated on `message.id` across the whole set, not per file (see the module
     docstring), so a response that does reach both parent and subagent is still counted
@@ -688,10 +694,14 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
     Under-reporting is visible in the numbers and recoverable; double-reporting is
     silent and corrupts the per-account view, so the doubt resolves the safe way.
     """
-    per_model: dict[str, dict[str, int]] = {}
+    per_key: dict[tuple, dict] = {}
     seen: set[str] = set()
     skipped = 0
     cwd = ""
+    # The hour the last stamped record belonged to. A record whose own stamp is
+    # unusable inherits it: a transcript is only ever appended to, so its neighbour is
+    # the closest thing to an answer there is.
+    hour = ""
 
     # Parent first: it is the session's own record of where it ran, and a subagent
     # inherits that directory rather than defining it.
@@ -716,6 +726,12 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
                     skipped += 1
                     continue
                 cwd = cwd or str(record.get("cwd") or "")
+
+                # Read before the usage block, so a record that spends nothing still
+                # moves the hour on for the ones that follow it.
+                own_hour = hour_of(record.get("timestamp"))
+                stamp = str(record.get("timestamp") or "") if own_hour else ""
+                hour = own_hour or hour
 
                 message = record.get("message")
                 if not isinstance(message, dict):
@@ -760,16 +776,104 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
                 if not any(counts.values()):
                     continue
 
-                entry = per_model.setdefault(model, dict.fromkeys(counts, 0) | {"calls": 0})
+                entry = per_key.setdefault((model, hour), dict.fromkeys(counts, 0) | {"calls": 0})
                 for key, value in counts.items():
                     entry[key] += value
                 entry["calls"] += 1
+                # The row's real span inside its hour, which is what lets a chart finer
+                # than an hour still put the spend where it happened. Compared as text:
+                # these are all the same ISO shape in the same zone, so `min` and `max`
+                # on the strings are `min` and `max` on the instants.
+                if stamp:
+                    entry["startedAt"] = min(entry.get("startedAt") or stamp, stamp)
+                    entry["endedAt"] = max(entry.get("endedAt") or stamp, stamp)
 
-    return per_model, skipped, cwd
+    return bucketize(per_key), skipped, cwd
 
 
 def num(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+"""The stamp shape both harnesses write. Anything else is not read — see `hour_of`."""
+
+
+def hour_of(value) -> str:
+    """
+    A record's `timestamp` → the hour it belongs to, `2026-09-03T07`, still in UTC.
+
+    Sliced rather than parsed, because the first 13 characters of an ISO-8601 UTC stamp
+    ARE the hour and both harnesses write exactly that shape
+    (`2026-09-03T07:05:17.365Z`). Parsing would buy nothing and cost the one thing that
+    matters here: a stamp in some other shape — an offset, a local time, a missing `T` —
+    must not be read into an hour that the offset makes wrong, so it is refused and the
+    record inherits its neighbour's hour instead.
+
+    UTC on purpose. The hour is half of an upsert key, so it has to mean the same thing
+    on a laptop that travels; the /usage chart cuts its own buckets in whatever zone
+    the reader is in, from the stamps, and never from this.
+    """
+    text = str(value or "")
+    return text[:13] if ISO_UTC_RE.match(text) else ""
+
+
+def bucketize(per_key: dict) -> dict:
+    """
+    Give every tally an hour, or take the hour off all of them.
+
+    A record with no usable stamp inherits the hour of the one before it, so the only
+    tallies that can arrive here without an hour are the ones before the FIRST stamped
+    record in the file. Their hour is not knowable, so they are folded into the
+    earliest hour their model has — the session's earliest if that model has none.
+
+    They cannot simply be left as they are: the server refuses a report that names the
+    hour for some entries and not others, because writing both a per-hour row and a
+    whole-session row for one model counts that model twice, and neither row looks
+    wrong on its own.
+
+    A transcript with no usable stamp ANYWHERE keeps no hour at all and reports the
+    pre-0.8.0 whole-session shape, which every server still handles.
+    """
+    hours = sorted({hour for _, hour in per_key if hour})
+    if not hours:
+        return per_key
+
+    merged: dict[tuple, dict] = {}
+    for (model, hour), totals in per_key.items():
+        if not hour:
+            own = sorted(h for m, h in per_key if m == model and h)
+            hour = own[0] if own else hours[0]
+        into = merged.setdefault((model, hour), {})
+        for field, value in totals.items():
+            if field in ("startedAt", "endedAt"):
+                kept = into.get(field)
+                into[field] = min(kept or value, value) if field == "startedAt" \
+                    else max(kept or value, value)
+            else:
+                into[field] = into.get(field, 0) + value
+    return merged
+
+
+def wire_models(per_key: dict) -> list:
+    """
+    The `models` array of a report — one entry per (model, hour).
+
+    `bucket` is carried as a full ISO stamp rather than the 13-character key, so that
+    it reads as a time to anything that parses it; the server floors it back to the
+    hour before it builds the upsert key, so the two cannot disagree.
+    """
+    entries = []
+    for (model, hour), totals in sorted(per_key.items()):
+        entry = {"model": model}
+        if hour:
+            entry["bucket"] = f"{hour}:00:00Z"
+        entry.update({k: v for k, v in totals.items() if k not in ("startedAt", "endedAt")})
+        for field in ("startedAt", "endedAt"):
+            if hour and totals.get(field):
+                entry[field] = totals[field]
+        entries.append(entry)
+    return entries
 
 
 def session_id_of(payload: dict, transcript: Path) -> str:
@@ -799,7 +903,7 @@ def body_of(config: dict, session: str, models: dict, cwd: str) -> dict:
         "device": device_of(config),
         "backend": backend[0],
         "baseUrl": backend[1],
-        "models": [{"model": model, **totals} for model, totals in sorted(models.items())],
+        "models": wire_models(models),
     }
 
 
