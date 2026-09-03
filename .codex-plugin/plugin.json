@@ -1,6 +1,6 @@
 {
   "name": "agents-usage",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Auto-records this machine's Codex CLI token usage into the agent platform's ledger (POST /api/v1/usage/sessions). Cumulative and idempotent: the hooks re-read the session rollout and send totals, so a hook that fires twice, or not at all, never mis-bills.",
   "author": { "name": "vannguyen799" },
   "repository": "https://github.com/vannguyen799/agents-usage",
