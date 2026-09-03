@@ -10,23 +10,32 @@ the platform sees none of it. This plugin closes that gap, for both, from one in
 
 ## Install
 
+Nothing to clone — the installer is served raw off this repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vannguyen799/agents-usage/refs/heads/main/scripts/install.sh \
+  | sh -s -- --platform both --url https://… --token aur_… --yes
+```
+
+The platform's own **/usage → "Report a machine"** panel prints that line with the URL
+and a freshly minted key already in it.
+
+Piped, there is no terminal to ask into, so `--url` and `--token` must be flags — an
+installer that reached the end without a key would leave a plugin that reports nothing
+and never says why. From a clone it can ask instead:
+
 ```bash
 scripts/install.sh
 ```
 
-It asks which CLI to report from, what URL and token to use (offering whatever a
-previous install already wrote), and then registers the marketplace **with updates
-switched on** and installs the plugin. Re-running it is how you change one answer:
-everything is a no-op when it is already done, and answering "keep" to the token
-question leaves the one on disk untouched.
-
-Unattended:
-
-```bash
-scripts/install.sh --platform both --url https://… --token aur_… --device dev-pc --yes
-```
+Either way it registers the marketplace **with updates switched on** and installs the
+plugin. Re-running it is how you change one answer: everything is a no-op when it is
+already done, and answering "keep" to the token question leaves the one on disk
+untouched — which is also how a machine moves to a rotated key.
 
 `--platform claude|codex|both` · `--source github|local` · `--device LABEL` · `--yes`.
+`--source local` installs the working tree instead of GitHub, so it needs the repo on
+disk and is refused down a pipe.
 
 ### By hand
 
