@@ -212,6 +212,29 @@ server refuses it.
 whole-session row from before it and per-hour rows from after — the first bucketed
 report deletes the old one, since the finer rows say everything it said.
 
+### The minute (0.9.0)
+
+The hour fixed the day chart and not the minute one: a row holding every response
+from 07:05 to 07:58 still had to be spread evenly across those 53 minutes, so /usage
+drew a flat line inside every busy hour. So 0.9.0 files each response under its UTC
+**minute** — the finest bucket /usage draws — and says so on the report with
+`"bucketSize": "minute"`; `bucket` becomes `2026-09-03T07:05:00Z`. A minute row lands
+whole in one chart bucket at every zoom, which is the picture a row per API call would
+draw at a quarter of the rows.
+
+A server older than 0.9.0 ignores `bucketSize`, floors each minute to its hour and folds
+them — the 0.8.x rows, exactly. A 0.9.0 server keys minutes apart from hours
+(`…T07:05` against `…T07`) and deletes the hour rows a minute report replaces, so a
+session live across the upgrade is not counted twice — and the minute rows an hour
+report replaces, for a session still running its 0.8.x hook after a 0.9.0 backfill.
+
+A report never carries more than 1,024 entries (the server's cap — about 17 busy hours
+on one model; the largest session measured had 262). Past it only the newest WHOLE
+hours are sent: the older minutes are final and went up with earlier reports.
+
+Sessions reported by 0.8.x stay hour-shaped until they report again; `--backfill
+<days>` re-reads recent transcripts and converts them.
+
 Rows land as `kind: cli`, `provider: claude-cli` or `codex-cli`, cost **$0**
 (subscription quota, not a bill), `conversationId` = the session id, and `accountId` =
 the login that spent it. They show up in the ledger and in the **By CLI account**

@@ -57,7 +57,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report_usage import (  # noqa: E402  (path first — a hook has no package to import from)
-    VERSION, bucketize, device_command, device_of, hour_of, load_config, log, num,
+    VERSION, bucketize, device_command, device_of, load_config, log, minute_of, num,
     path_label, post, project_of, safe_url, slug_of, wire_models,
 )
 
@@ -169,7 +169,7 @@ def tally(rollout: Path, accepted: set) -> dict:
     A reading SMALLER than the one before it is a restarted counter, not a negative
     spend — handled where it happens, below.
 
-    Each delta is also filed under the HOUR of the event that carried it, which the
+    Each delta is also filed under the MINUTE of the event that carried it, which the
     rollout stamps like everything else. A Codex session runs as long as anyone leaves
     it running, and one row for the whole of it can only be charted as an even smear
     over every hour it was open. The delta already belongs to a moment; this only has
@@ -180,7 +180,7 @@ def tally(rollout: Path, accepted: set) -> dict:
     previous = {}
     pending = []
     per_key = {}
-    hour = ""
+    minute = ""
 
     try:
         handle = rollout.open(encoding="utf-8", errors="replace")
@@ -229,11 +229,11 @@ def tally(rollout: Path, accepted: set) -> dict:
             if not isinstance(totals, dict):
                 continue
 
-            # An event whose stamp is unusable inherits the hour of the one before it;
+            # An event whose stamp is unusable inherits the minute of the one before it;
             # a rollout is only ever appended to, so its neighbour is the best answer
             # available. Ones before the first usable stamp are placed by `bucketize`.
-            hour = hour_of(record.get("timestamp")) or hour
-            stamp = str(record.get("timestamp") or "") if hour_of(record.get("timestamp")) else ""
+            minute = minute_of(record.get("timestamp")) or minute
+            stamp = str(record.get("timestamp") or "") if minute_of(record.get("timestamp")) else ""
 
             counts = classes(totals)
             if sum(counts.values()) < sum(previous.values()):
@@ -256,11 +256,11 @@ def tally(rollout: Path, accepted: set) -> dict:
                 continue  # a duplicate or a rate-limit-only event — nothing was spent
 
             if model:
-                add(per_key, model, hour, step, stamp)
+                add(per_key, model, minute, step, stamp)
             else:
                 # Held one event per entry rather than folded into a running total:
-                # the hour differs between them, and so does the call each one counts.
-                pending.append((hour, step, stamp))
+                # the minute differs between them, and so does the call each one counts.
+                pending.append((minute, step, stamp))
 
     if pending:
         # Spend that no turn_context ever named a model for. Dropped rather than filed
@@ -299,13 +299,13 @@ def classes(totals: dict) -> dict:
     }
 
 
-def add(per_key: dict, model: str, hour: str, step: dict, stamp: str) -> None:
-    """One event's spend, folded into the (model, hour) it belongs to.
+def add(per_key: dict, model: str, minute: str, step: dict, stamp: str) -> None:
+    """One event's spend, folded into the (model, minute) it belongs to.
 
-    `stamp` narrows the row's span to the events actually inside its hour — compared as
-    text, which is the same as comparing the instants while every stamp is ISO-8601 in
-    UTC, and `hour_of` accepts nothing else."""
-    entry = per_key.setdefault((model, hour), {k: 0 for k in step} | {"calls": 0})
+    `stamp` narrows the row's span to the events actually inside its minute — compared
+    as text, which is the same as comparing the instants while every stamp is ISO-8601
+    in UTC, and `minute_of` accepts nothing else."""
+    entry = per_key.setdefault((model, minute), {k: 0 for k in step} | {"calls": 0})
     for key, value in step.items():
         entry[key] = entry.get(key, 0) + value
     entry["calls"] += 1
@@ -379,6 +379,7 @@ def body_of(config: dict, session: dict, fallback_id: str) -> dict:
         "device": device_of(config),
         "backend": backend[0],
         "baseUrl": backend[1],
+        "bucketSize": "minute",
         "models": wire_models(session["models"]),
     }
 

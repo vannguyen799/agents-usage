@@ -20,10 +20,10 @@ import report_codex_usage as reporter  # noqa: E402
 
 FAILURES = []
 
-HOUR = "2026-08-28T04"
-"""The hour every event below lands in unless it says otherwise. A tally is keyed by
-(model, hour) since 0.8.0 — a session is a span, and one row for all of it can only be
-charted as a flat smear over every hour it was open."""
+MINUTE = "2026-08-28T04:10"
+"""The minute every event below lands in unless it says otherwise. A tally is keyed by
+(model, minute) since 0.9.0 — a session is a span, and a row covering more than one
+chart bucket can only be charted as a flat smear over all of them."""
 
 
 def check(name: str, got, want) -> None:
@@ -51,10 +51,10 @@ def turn(model: str) -> dict:
 
 
 def tokens(input_tokens: int, cached: int, output: int, reasoning: int = 0,
-           at: str = f"{HOUR}:10:00.000Z") -> dict:
+           at: str = f"{MINUTE}:00.000Z") -> dict:
     """One `token_count` event, carrying the session's CUMULATIVE totals.
 
-    `at` is the stamp the rollout writes against it, and the hour of that stamp is what
+    `at` is the stamp the rollout writes against it, and the minute of that stamp is what
     the delta is filed under. Passing `None` is a record with no usable stamp."""
     record = {"type": "event_msg", "payload": {"type": "token_count", "info": {
         "total_token_usage": {
@@ -80,7 +80,7 @@ def tally(records: list, accepted=("codex-tui",)) -> dict:
 
 
 def models_of(session: dict) -> dict:
-    """Every tally, keyed by (model, hour), with the span stripped off — the counts are
+    """Every tally, keyed by (model, minute), with the span stripped off — the counts are
     what most cases here are about, and `startedAt` has its own section."""
     return {
         key: {k: v for k, v in totals.items() if k not in ("startedAt", "endedAt")}
@@ -88,8 +88,8 @@ def models_of(session: dict) -> dict:
     }
 
 
-def counts_of(session: dict, model: str = "gpt-5.6-terra", hour: str = HOUR) -> dict:
-    return models_of(session)[(model, hour)]
+def counts_of(session: dict, model: str = "gpt-5.6-terra", minute: str = MINUTE) -> dict:
+    return models_of(session)[(model, minute)]
 
 
 print("cumulative totals become deltas")
@@ -100,7 +100,7 @@ session = tally([
     tokens(900, 700, 30),
     tokens(1500, 1200, 60),
 ])
-check("summed once, not once per turn", models_of(session), {("gpt-5.6-terra", HOUR): {
+check("summed once, not once per turn", models_of(session), {("gpt-5.6-terra", MINUTE): {
     "promptTokens": 300, "completionTokens": 60, "cacheReadTokens": 1200, "calls": 3,
 }})
 check("and the deltas add back up to the last reading",
@@ -141,9 +141,9 @@ session = tally([
     turn("gpt-5.6-sol"), tokens(1000, 0, 100),
 ])
 check("each model keeps its own share", models_of(session), {
-    ("gpt-5.6-terra", HOUR): {
+    ("gpt-5.6-terra", MINUTE): {
         "promptTokens": 400, "completionTokens": 40, "cacheReadTokens": 0, "calls": 1},
-    ("gpt-5.6-sol", HOUR): {
+    ("gpt-5.6-sol", MINUTE): {
         "promptTokens": 600, "completionTokens": 60, "cacheReadTokens": 0, "calls": 1},
 })
 
@@ -176,40 +176,43 @@ session = tally([meta(), tokens(500, 0, 50), turn("gpt-5.6-terra"), tokens(800, 
 check("but kept when a later turn names one", counts_of(session)["promptTokens"], 800)
 session = tally([
     meta(),
-    tokens(500, 0, 50, at=f"{HOUR}:10:00.000Z"),
+    tokens(500, 0, 50, at=f"{MINUTE}:00.000Z"),
     tokens(900, 0, 90, at="2026-08-28T06:10:00.000Z"),
     turn("gpt-5.6-terra"),
 ])
-check("…each in the hour it was actually spent in, not all in the first",
+check("…each in the minute it was actually spent in, not all in the first",
       {key: totals["promptTokens"] for key, totals in models_of(session).items()},
-      {("gpt-5.6-terra", HOUR): 500, ("gpt-5.6-terra", "2026-08-28T06"): 400})
+      {("gpt-5.6-terra", MINUTE): 500, ("gpt-5.6-terra", "2026-08-28T06:10"): 400})
 
-print("\nthe hour a delta was spent in")
-# The case the split exists for: one session, left running, spending in two hours.
+print("\nthe minute a delta was spent in")
+# The case the split exists for: one session, left running, spending in bursts. The
+# 04:05 and 04:40 deltas were ONE row in 0.8.x, drawn flat across the minutes between.
 session = tally([
     meta(), turn("gpt-5.6-terra"),
-    tokens(1_000, 0, 100, at=f"{HOUR}:05:00.000Z"),
-    tokens(1_000, 0, 100, at=f"{HOUR}:55:00.000Z"),   # a repeat: spends nothing
+    tokens(1_000, 0, 100, at="2026-08-28T04:05:00.000Z"),
+    tokens(1_000, 0, 100, at="2026-08-28T04:05:30.000Z"),   # a repeat: spends nothing
+    tokens(1_500, 0, 150, at="2026-08-28T04:40:00.000Z"),
     tokens(3_000, 0, 300, at="2026-08-28T05:30:00.000Z"),
 ])
-check("a session spanning two hours is two tallies",
+check("a session spanning three minutes is three tallies",
       {key: totals["promptTokens"] for key, totals in models_of(session).items()},
-      {("gpt-5.6-terra", HOUR): 1_000, ("gpt-5.6-terra", "2026-08-28T05"): 2_000})
-check("the span is the events, not the whole hour",
-      (session["models"][("gpt-5.6-terra", HOUR)]["startedAt"],
-       session["models"][("gpt-5.6-terra", HOUR)]["endedAt"]),
-      (f"{HOUR}:05:00.000Z", f"{HOUR}:05:00.000Z"))
+      {("gpt-5.6-terra", "2026-08-28T04:05"): 1_000, ("gpt-5.6-terra", "2026-08-28T04:40"): 500,
+       ("gpt-5.6-terra", "2026-08-28T05:30"): 1_500})
+check("the span is the events, not the whole minute",
+      (session["models"][("gpt-5.6-terra", "2026-08-28T04:05")]["startedAt"],
+       session["models"][("gpt-5.6-terra", "2026-08-28T04:05")]["endedAt"]),
+      ("2026-08-28T04:05:00.000Z", "2026-08-28T04:05:00.000Z"))
 
 print("\nstamps that cannot be read")
 session = tally([
     meta(), turn("gpt-5.6-terra"),
-    tokens(1_000, 0, 100, at=f"{HOUR}:05:00.000Z"),
+    tokens(1_000, 0, 100, at=f"{MINUTE}:00.000Z"),
     tokens(3_000, 0, 300, at="28/08/2026 05:30"),   # not ISO — unusable
 ])
-check("an unreadable stamp inherits the hour before it, not a new bucket",
-      sorted(models_of(session)), [("gpt-5.6-terra", HOUR)])
+check("an unreadable stamp inherits the minute before it, not a new bucket",
+      sorted(models_of(session)), [("gpt-5.6-terra", MINUTE)])
 check("…and does not widen the span it was not part of",
-      session["models"][("gpt-5.6-terra", HOUR)]["endedAt"], f"{HOUR}:05:00.000Z")
+      session["models"][("gpt-5.6-terra", MINUTE)]["endedAt"], f"{MINUTE}:00.000Z")
 
 session = tally([
     meta(), turn("gpt-5.6-terra"),
@@ -226,10 +229,10 @@ session = tally([
     tokens(1_000, 0, 100, at=None),                  # before any usable stamp
     tokens(3_000, 0, 300, at="2026-08-28T05:30:00.000Z"),
 ])
-check("spend before the first usable stamp joins the earliest hour there is",
-      sorted(models_of(session)), [("gpt-5.6-terra", "2026-08-28T05")])
+check("spend before the first usable stamp joins the earliest minute there is",
+      sorted(models_of(session)), [("gpt-5.6-terra", "2026-08-28T05:30")])
 check("…keeping every token, not just the stamped ones",
-      counts_of(session, hour="2026-08-28T05")["promptTokens"], 3_000)
+      counts_of(session, minute="2026-08-28T05:30")["promptTokens"], 3_000)
 
 print("\nthe project label")
 session = tally([meta(), turn("gpt-5.6-terra"), tokens(1, 0, 1)])
@@ -243,6 +246,11 @@ session = tally([meta(), turn("gpt-5.6-terra"), tokens(1, 0, 1)])
 check("openai is native", session["backend"], ("firstParty", ""))
 session = tally([meta(model_provider="ollama"), turn("gpt-5.6-terra"), tokens(1, 0, 1)])
 check("another vendor is not claimed as native", session["backend"], ("custom", ""))
+
+print("\nthe wire")
+# Without it the server floors every bucket to the HOUR and keys 0.8.x rows again.
+check("the report says its buckets are minutes",
+      reporter.body_of(reporter.load_config(), session, "s")["bucketSize"], "minute")
 
 print()
 if FAILURES:
