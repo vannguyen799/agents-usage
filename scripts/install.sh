@@ -208,8 +208,18 @@ if [ -n "$EXISTING" ]; then say "found an existing config at $(field path)"; fi
 step "Where does this machine report to?"
 [ -n "$URL" ] || URL=$(ask "  platform URL" "$(field url || true)")
 [ -n "$URL" ] || URL="$DEFAULT_URL"
-case "$URL" in http://*|https://*) ;; *) die "the URL must start with http:// or https://" ;; esac
 URL=$(printf '%s' "$URL" | sed 's#/*$##')
+# Plain http only to this machine itself: the reporting key rides in every request's
+# Authorization header, and over http anyone on the path reads it. The reporter
+# enforces the same rule (`url_allowed` in report_usage.py) and refuses to send.
+case "$URL" in
+  https://*) ;;
+  http://localhost|http://localhost:*|http://localhost/*|\
+  http://127.0.0.1|http://127.0.0.1:*|http://127.0.0.1/*|\
+  http://\[::1\]|http://\[::1\]:*|http://\[::1\]/*) ;;
+  http://*) die "plain http:// is refused except for localhost — the reporting key would travel in the clear. Use https://" ;;
+  *) die "the URL must start with https:// (or http://localhost for a local platform)" ;;
+esac
 
 if [ -z "$TOKEN" ]; then
   if [ "$(field hasToken)" = "True" ]; then TOKEN=$(ask_secret "  API token" "$KEEP")

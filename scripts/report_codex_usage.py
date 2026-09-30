@@ -57,8 +57,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report_usage import (  # noqa: E402  (path first — a hook has no package to import from)
-    VERSION, bucketize, device_command, device_of, load_config, log, minute_of, num,
-    path_label, post, project_of, safe_url, slug_of, wire_models,
+    VERSION, WorkerLock, bucketize, configured, deliver, device_command, device_of,
+    flush_spool, hook_entry, load_config, log, minute_of, num, path_label, project_of,
+    read_payload, run_worker, safe_url, slug_of, state_root, wire_models,
 )
 
 USER_AGENT = f"agents-usage/{VERSION} (codex-cli-hook)"
@@ -396,43 +397,66 @@ def session_id_of(payload: dict, rollout: Path) -> str:
     return "-".join(rollout.stem.split("-")[-5:])
 
 
+def report_rollout(config: dict, payload: dict, rollout: Path, spool: Path, dry_run: bool = False) -> None:
+    """
+    One rollout, read whole and sent whole — a rollout is one file with no subagent
+    tree beside it, so re-reading it is cheap next to the Claude Code case. What it
+    shares with that reporter is the delivery: in the background, behind the lock,
+    and spooled when the platform cannot take it.
+    """
+    session = tally(rollout, originators(config))
+    if not session:
+        return
+    body = body_of(config, session, session_id_of(payload, rollout))
+    if not body["sessionId"]:
+        return
+    if dry_run:
+        print(json.dumps(body, indent=2))
+        return
+    deliver(config, body, spool, USER_AGENT)
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--set-device" in argv:
         return device_command(argv, CONFIG_PATH)
     dry_run = "--print" in argv
+    root = state_root() / "codex"
+    spool = root / "spool"
 
-    payload = {}
-    if not sys.stdin.isatty():
-        try:
-            raw = sys.stdin.read()
-            payload = json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-
+    payload = {} if "--worker" in argv else read_payload()
     config = load_config(CONFIG_PATH)
-    if not dry_run and not (config["enabled"] and config["url"] and config["token"]):
-        log("skipped: not configured (need url + token, and enabled)")
+
+    if dry_run:
+        for rollout in rollouts_of(payload, argv):
+            if rollout.is_file():
+                report_rollout(config, payload, rollout, spool, dry_run=True)
         return 0
 
-    accepted = originators(config)
-    for rollout in rollouts_of(payload, argv):
-        if not rollout.is_file():
-            continue
-        session = tally(rollout, accepted)
-        if not session:
-            continue
-        body = body_of(config, session, session_id_of(payload, rollout))
-        if not body["sessionId"]:
-            continue
-        if dry_run:
-            print(json.dumps(body, indent=2))
-            continue
-        post(config, body, USER_AGENT)
+    if not configured(config):
+        return 0
 
-    return 0
+    def handle(queued: dict, _context: dict) -> None:
+        for rollout in rollouts_of(queued, []):
+            if rollout.is_file():
+                report_rollout(config, queued, rollout, spool)
+
+    if "--worker" in argv:
+        return run_worker(root, config, handle, USER_AGENT)
+
+    if "--backfill" in argv:
+        lock = WorkerLock(root, blocking=True)
+        lock.acquire()
+        try:
+            for rollout in rollouts_of(payload, argv):
+                if rollout.is_file():
+                    report_rollout(config, payload, rollout, spool)
+            flush_spool(config, spool, USER_AGENT)
+        finally:
+            lock.release()
+        return 0
+
+    return hook_entry(root, Path(__file__).resolve(), payload, {}, config, handle, USER_AGENT)
 
 
 if __name__ == "__main__":

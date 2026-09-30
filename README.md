@@ -124,7 +124,14 @@ nothing needs re-installing.
 Environment variables override the file, so one shell can be pointed elsewhere for a
 test: `AGENTS_USAGE_URL`, `AGENTS_USAGE_TOKEN`, `AGENTS_USAGE_ENABLED=0`,
 `AGENTS_USAGE_CONFIG`, `AGENTS_USAGE_ENTRYPOINTS`, `AGENTS_USAGE_ORIGINATORS`,
-`AGENTS_USAGE_DEVICE`, `AGENTS_USAGE_PYTHON`, `AGENTS_USAGE_DEBUG=1`.
+`AGENTS_USAGE_DEVICE`, `AGENTS_USAGE_PYTHON`, `AGENTS_USAGE_DEBUG=1`,
+`AGENTS_USAGE_STATE_DIR` (default `~/.cache/agents-usage`), `AGENTS_USAGE_SYNC=1` (run
+the report in the foreground, for debugging).
+
+**The URL must be `https://`.** Plain `http://` is accepted only for `localhost` /
+`127.0.0.1` / `[::1]`: the key travels in every report's Authorization header. Both
+`install.sh` and the reporters refuse anything else, and the reporters never follow a
+redirect (urllib would turn a redirected POST into a GET that re-sends the header).
 
 ### Name this machine
 
@@ -172,6 +179,22 @@ Cumulative + upsert is the whole design. Hooks fire an unpredictable number of t
 are retried, and can miss a turn entirely; sending totals-so-far means the row
 converges regardless, and neither side keeps a watermark that could be lost and
 re-counted.
+
+### In the background, and only what is new
+
+The hook itself only queues its payload and starts a detached worker, so the session
+never waits on a report. One worker runs at a time per CLI (`flock -n` on
+`<state>/<cli>/worker.lock`); a hook that finds it busy leaves its payload in the queue
+and the running worker drains it before it exits.
+
+The Claude Code worker keeps a byte offset per transcript file (and per subagent file)
+in `<state>/claude/state/`, and parses only the lines written since the last run. What
+it keeps is the session's FULL running total per (model, minute), and it sends only the
+minutes whose total changed — still as totals, never deltas, so the upsert converges
+exactly as before. Deleting the state dir costs one full re-read and re-send, nothing
+else. A report the platform cannot take (no answer, 5xx, 429, an expired key) is kept
+in `<state>/<cli>/spool/`, merged with anything already spooled for that session, and
+sent on a later run; spooled reports expire after 14 days.
 
 ### The hour (0.8.0)
 

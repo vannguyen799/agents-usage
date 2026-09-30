@@ -696,102 +696,159 @@ def tally(transcript: Path, entrypoints: set) -> tuple[dict, int, str]:
     A record whose `entrypoint` is missing or unrecognised is SKIPPED, not reported.
     Under-reporting is visible in the numbers and recoverable; double-reporting is
     silent and corrupts the per-account view, so the doubt resolves the safe way.
-    """
-    per_key: dict[tuple, dict] = {}
-    seen: set[str] = set()
-    skipped = 0
-    cwd = ""
-    # The minute the last stamped record belonged to. A record whose own stamp is
-    # unusable inherits it: a transcript is only ever appended to, so its neighbour is
-    # the closest thing to an answer there is.
-    minute = ""
 
+    THE WHOLE SET IS READ HERE; the hook reads only what is new — see `advance`, which
+    this is built on, starting from an empty state.
+    """
+    state = new_state(entrypoints)
+    advance(state, transcript)
+    return bucketize(state["per_key"]), state["skipped"], state["cwd"]
+
+
+def new_state(entrypoints: set) -> dict:
+    """
+    What `advance` carries from one read of a session to the next.
+
+    `per_key` holds the session's FULL cumulative totals so far — never a delta — so
+    what is sent from it is still a total and the server's upsert still converges.
+    `seen` is the dedup set across every file of the session, `files` the byte offset
+    reached in each, and the minute its last stamped record belonged to.
+    """
+    return {
+        "entrypoints": sorted(entrypoints),
+        "files": {},
+        "seen": set(),
+        "skipped": 0,
+        "cwd": "",
+        "per_key": {},
+    }
+
+
+def advance(state: dict, transcript: Path) -> bool:
+    """
+    Fold every COMPLETE line written since the last call into `state`. Returns False
+    when a file was truncated or replaced — the offsets no longer mean anything and
+    the caller must start over from an empty state.
+
+    Only whole lines are consumed: a line still being written has no newline yet, and
+    consuming it would skip it for good (the full re-read used to shrug it off as a
+    parse error and pick it up next time — an offset cannot).
+
+    The inherited minute (see `_consume`) is carried PER FILE, not across files: a
+    record's minute then depends only on the lines above it in its own file, so it is
+    the same whichever order the files are read in and however many runs the reading
+    took. A subagent file's leading unstamped records fall into `bucketize`'s fold
+    instead of borrowing the parent's last minute.
+    """
+    entrypoints = set(state["entrypoints"])
     # Parent first: it is the session's own record of where it ran, and a subagent
     # inherits that directory rather than defining it.
     for path in [transcript, *nested_transcripts(transcript)]:
         try:
-            handle = path.open(encoding="utf-8", errors="replace")
+            info = path.stat()
         except OSError:
             continue
+        mark = state["files"].setdefault(str(path), {"offset": 0, "ino": info.st_ino, "minute": ""})
+        if info.st_size < mark["offset"] or (mark.get("ino") and mark["ino"] != info.st_ino):
+            return False
+        if info.st_size == mark["offset"]:
+            continue
+        try:
+            with path.open("rb") as fh:
+                fh.seek(mark["offset"])
+                data = fh.read()
+        except OSError:
+            continue
+        end = data.rfind(b"\n")
+        if end < 0:
+            continue
+        mark["offset"] += end + 1
+        mark["ino"] = info.st_ino
+        for raw in data[:end].split(b"\n"):
+            _consume(state, mark, raw.decode("utf-8", errors="replace"), entrypoints)
+    return True
 
-        with handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue  # a partially written line while the session is live
-                if not isinstance(record, dict) or record.get("type") != "assistant":
-                    continue
-                if str(record.get("entrypoint") or "") not in entrypoints:
-                    skipped += 1
-                    continue
-                cwd = cwd or str(record.get("cwd") or "")
 
-                # Read before the usage block, so a record that spends nothing still
-                # moves the minute on for the ones that follow it.
-                own_minute = minute_of(record.get("timestamp"))
-                stamp = str(record.get("timestamp") or "") if own_minute else ""
-                minute = own_minute or minute
+def _consume(state: dict, mark: dict, line: str, entrypoints: set) -> None:
+    """One transcript line into the running tally. See `tally` for the rules."""
+    per_key = state["per_key"]
+    seen = state["seen"]
+    line = line.strip()
+    if not line:
+        return
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return  # not JSON at all — a whole line, so not a partial write
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return
+    if str(record.get("entrypoint") or "") not in entrypoints:
+        state["skipped"] += 1
+        return
+    state["cwd"] = state["cwd"] or str(record.get("cwd") or "")
 
-                message = record.get("message")
-                if not isinstance(message, dict):
-                    continue
-                usage = message.get("usage")
-                if not isinstance(usage, dict):
-                    continue
+    # Read before the usage block, so a record that spends nothing still moves the
+    # minute on for the ones that follow it. A record whose own stamp is unusable
+    # inherits the last one: a transcript is only ever appended to, so its neighbour
+    # is the closest thing to an answer there is.
+    own_minute = minute_of(record.get("timestamp"))
+    stamp = str(record.get("timestamp") or "") if own_minute else ""
+    mark["minute"] = own_minute or mark["minute"]
+    minute = mark["minute"]
 
-                # One API response, many transcript lines — count it once.
-                key = message.get("id") or record.get("requestId") or record.get("uuid")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return
 
-                model = str(message.get("model") or "").strip()
-                # `<synthetic>` is Claude Code speaking for itself (an API error rendered
-                # as an assistant turn); no model ran and no quota was spent.
-                if not model or model.startswith("<"):
-                    continue
+    # One API response, many transcript lines — count it once.
+    key = message.get("id") or record.get("requestId") or record.get("uuid")
+    if not key or key in seen:
+        return
+    seen.add(key)
 
-                # The per-TTL split is what `cache_creation` carries, and it is read
-                # rather than assumed: the two TTLs weigh differently (x2 against
-                # x1.25) and both occur -- across 120 transcripts here, 95.7% of write
-                # tokens are 1-hour and 9% of sessions write some 5-minute ones.
-                # The flat `cache_creation_input_tokens` is the older shape and carries
-                # no TTL at all; it falls to the 1-hour bucket, the larger case, since
-                # guessing the cheaper one would under-count that term by 37.5%.
-                created = usage.get("cache_creation")
-                created = created if isinstance(created, dict) else {}
-                write_5m = num(created.get("ephemeral_5m_input_tokens"))
-                write_1h = num(created.get("ephemeral_1h_input_tokens"))
-                if not write_5m and not write_1h:
-                    write_1h = num(usage.get("cache_creation_input_tokens"))
+    model = str(message.get("model") or "").strip()
+    # `<synthetic>` is Claude Code speaking for itself (an API error rendered as an
+    # assistant turn); no model ran and no quota was spent.
+    if not model or model.startswith("<"):
+        return
 
-                counts = {
-                    "promptTokens": num(usage.get("input_tokens")),
-                    "completionTokens": num(usage.get("output_tokens")),
-                    "cacheReadTokens": num(usage.get("cache_read_input_tokens")),
-                    "cacheWrite5mTokens": write_5m,
-                    "cacheWrite1hTokens": write_1h,
-                }
-                if not any(counts.values()):
-                    continue
+    # The per-TTL split is what `cache_creation` carries, and it is read rather than
+    # assumed: the two TTLs weigh differently (x2 against x1.25) and both occur --
+    # across 120 transcripts here, 95.7% of write tokens are 1-hour and 9% of
+    # sessions write some 5-minute ones. The flat `cache_creation_input_tokens` is the
+    # older shape and carries no TTL at all; it falls to the 1-hour bucket, the larger
+    # case, since guessing the cheaper one would under-count that term by 37.5%.
+    created = usage.get("cache_creation")
+    created = created if isinstance(created, dict) else {}
+    write_5m = num(created.get("ephemeral_5m_input_tokens"))
+    write_1h = num(created.get("ephemeral_1h_input_tokens"))
+    if not write_5m and not write_1h:
+        write_1h = num(usage.get("cache_creation_input_tokens"))
 
-                entry = per_key.setdefault((model, minute), dict.fromkeys(counts, 0) | {"calls": 0})
-                for key, value in counts.items():
-                    entry[key] += value
-                entry["calls"] += 1
-                # The row's real span inside its minute — the server clamps it there and
-                # the chart files it whole in one bucket. Compared as text:
-                # these are all the same ISO shape in the same zone, so `min` and `max`
-                # on the strings are `min` and `max` on the instants.
-                if stamp:
-                    entry["startedAt"] = min(entry.get("startedAt") or stamp, stamp)
-                    entry["endedAt"] = max(entry.get("endedAt") or stamp, stamp)
+    counts = {
+        "promptTokens": num(usage.get("input_tokens")),
+        "completionTokens": num(usage.get("output_tokens")),
+        "cacheReadTokens": num(usage.get("cache_read_input_tokens")),
+        "cacheWrite5mTokens": write_5m,
+        "cacheWrite1hTokens": write_1h,
+    }
+    if not any(counts.values()):
+        return
 
-    return bucketize(per_key), skipped, cwd
+    entry = per_key.setdefault((model, minute), dict.fromkeys(counts, 0) | {"calls": 0})
+    for field, value in counts.items():
+        entry[field] += value
+    entry["calls"] += 1
+    # The row's real span inside its minute — the server clamps it there and the chart
+    # files it whole in one bucket. Compared as text: these are all the same ISO shape
+    # in the same zone, so `min` and `max` on the strings are `min` and `max` on the
+    # instants.
+    if stamp:
+        entry["startedAt"] = min(entry.get("startedAt") or stamp, stamp)
+        entry["endedAt"] = max(entry.get("endedAt") or stamp, stamp)
 
 
 def num(value) -> int:
@@ -864,7 +921,7 @@ the machine this was written on had 262 (model, minute) entries across 2,411 ses
 17 busy hours on one model would reach it."""
 
 
-def wire_models(per_key: dict) -> list:
+def wire_models(per_key: dict, cap: bool = True) -> list:
     """
     The `models` array of a report — one entry per (model, minute).
 
@@ -890,7 +947,7 @@ def wire_models(per_key: dict) -> list:
             if minute and totals.get(field):
                 entry[field] = totals[field]
         entries.append(entry)
-    if len(entries) > MAX_ENTRIES:
+    if cap and len(entries) > MAX_ENTRIES:
         # ponytail: drops the oldest hours of a session no earlier report covered
         # (hooks dead for 17+ busy hours); chunked posts if that ever shows up in logs.
         cut = sorted(e.get("bucket", "")[:13] for e in entries)[-MAX_ENTRIES]
@@ -908,7 +965,8 @@ def session_id_of(payload: dict, transcript: Path) -> str:
     return transcript.stem
 
 
-def body_of(config: dict, session: str, models: dict, cwd: str) -> dict:
+def body_of(config: dict, session: str, models: dict, cwd: str, context: dict | None = None,
+            cap: bool = True) -> dict:
     """
     The wire shape of one report — built in ONE place so `--print` cannot drift from
     what is actually sent, which is the only way to check this without a server.
@@ -916,24 +974,88 @@ def body_of(config: dict, session: str, models: dict, cwd: str) -> dict:
     `provider` names WHICH CLI spent the quota. A server older than 0.7.0 ignores the
     field and files the row as `claude-cli`, which is what every row from here has
     always been, so sending it costs an old deploy nothing.
+
+    `context` is what the HOOK's environment said (`hook_context`), captured when the
+    hook fired: the report is built later, in a background worker that may be draining
+    another session's hook, whose environment is not this session's.
     """
-    backend = backend_of()
+    context = context or hook_context()
+    backend = tuple(context.get("backend") or ("firstParty", ""))
     return {
         "sessionId": session,
         "provider": "claude-cli",
-        "accountId": claude_account_id(),
+        "accountId": context.get("account") or "",
         "project": project_of(cwd),
         "device": device_of(config),
         "backend": backend[0],
         "baseUrl": backend[1],
         "bucketSize": "minute",
-        "models": wire_models(models),
+        "models": wire_models(models, cap),
     }
 
 
-def post(config: dict, body: dict, user_agent: str = USER_AGENT) -> bool:
+def hook_context() -> dict:
+    """The environment-derived fields of a report, read in the hook's own process."""
+    return {"backend": list(backend_of()), "account": claude_account_id()}
+
+
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+"""The only hosts a report may go to over plain http — this machine itself."""
+
+
+def url_allowed(url: str) -> bool:
     """
-    POST one report to the ledger.
+    https anywhere; plain http only to this machine.
+
+    The reporting key rides in every report's Authorization header, so over http
+    anyone on the path reads it — once a turn, from every machine. `install.sh`
+    refuses such a URL up front; this refuses it again for a config edited by hand.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme == "https" and parts.hostname:
+        return True
+    return parts.scheme == "http" and (parts.hostname or "") in LOCAL_HOSTS
+
+
+def configured(config: dict) -> bool:
+    """Whether this box may report at all. Says why not, in the debug log."""
+    if not (config["enabled"] and config["url"] and config["token"]):
+        log("skipped: not configured (need url + token, and enabled)")
+        return False
+    if not url_allowed(config["url"]):
+        log(f"skipped: {safe_url(config['url'])} is plain http to a remote host — "
+            "the key would travel in the clear; use https://")
+        return False
+    return True
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """
+    Refuse every redirect: the 3xx surfaces as an HTTPError instead of being followed.
+
+    urllib follows a redirected POST as a GET — the body dropped, so the report is
+    silently not made — and re-sends the Authorization header to wherever the
+    redirect points, which need not be the platform at all.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+DROP_STATUSES = frozenset({400, 413, 422})
+"""Refusals that resending the same body can never turn into a success — the body
+itself is wrong. Anything else (a 5xx, 429, an expired token, a misconfigured URL
+answering 3xx, no answer at all) is spooled and tried again later."""
+
+
+def post_status(config: dict, body: dict, user_agent: str = USER_AGENT) -> str:
+    """
+    POST one report to the ledger: "ok", "retry" (spool it) or "drop" (never will).
 
     Shared with the Codex reporter: the endpoint, the timeout, the failure handling
     and the User-Agent are properties of the PLATFORM, not of the CLI being reported
@@ -941,6 +1063,9 @@ def post(config: dict, body: dict, user_agent: str = USER_AGENT) -> bool:
     forgotten.
     """
     session = body.get("sessionId")
+    if not url_allowed(config.get("url") or ""):
+        log(f"reported {session}: refused, not https")
+        return "retry"
     request = urllib.request.Request(
         f"{config['url']}/api/v1/usage/sessions",
         data=json.dumps(body).encode("utf-8"),
@@ -955,14 +1080,413 @@ def post(config: dict, body: dict, user_agent: str = USER_AGENT) -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+        with _OPENER.open(request, timeout=TIMEOUT_S) as response:
             log(f"reported {session}: {response.status} {response.read(200)!r}")
-            return True
+            return "ok"
     except urllib.error.HTTPError as err:
         log(f"reported {session}: HTTP {err.code} {err.read(200)!r}")
+        return "drop" if err.code in DROP_STATUSES else "retry"
     except (urllib.error.URLError, OSError, ValueError) as err:
         log(f"reported {session}: {err}")
-    return False
+    return "retry"
+
+
+def post(config: dict, body: dict, user_agent: str = USER_AGENT) -> bool:
+    """`post_status`, as the yes/no older callers expect."""
+    return post_status(config, body, user_agent) == "ok"
+
+
+# ------------------------------------------------------------------------------------
+# Delivery: the chunks, the spool
+# ------------------------------------------------------------------------------------
+
+def chunks_of(body: dict) -> list:
+    """
+    One body per request, each within the server's `MAX_ENTRIES`.
+
+    Split at HOUR boundaries, never inside one: the server deletes a 0.8.x hour row
+    as soon as minutes for that hour arrive, and half an hour of minutes would leave
+    the other half counted nowhere. A single hour holds at most 60 minutes per model,
+    so a group never outgrows a chunk on its own for any realistic model count.
+    """
+    models = body.get("models") or []
+    if len(models) <= MAX_ENTRIES:
+        return [body]
+    hours: dict = {}
+    for entry in models:
+        hours.setdefault(str(entry.get("bucket", ""))[:13], []).append(entry)
+    out, current = [], []
+    for hour in sorted(hours):
+        group = hours[hour]
+        if current and len(current) + len(group) > MAX_ENTRIES:
+            out.append(current)
+            current = []
+        current = current + group
+    if current:
+        out.append(current)
+    return [dict(body, models=chunk) for chunk in out]
+
+
+def post_chunks(config: dict, body: dict, user_agent: str = USER_AGENT) -> str:
+    """Post every chunk; the worst answer wins (retry > drop > ok)."""
+    outcome = "ok"
+    for chunk in chunks_of(body):
+        result = post_status(config, chunk, user_agent)
+        if result == "retry":
+            return "retry"
+        if result == "drop":
+            outcome = "drop"
+    return outcome
+
+
+SPOOL_MAX_AGE_S = 14 * 86400
+"""A spooled report older than this is dropped unsent. The transcript is still on disk;
+deleting the state dir re-sends everything it holds."""
+
+SPOOL_FLUSH_MAX = 20
+"""Spooled reports tried per run — a platform back from an outage is not hammered."""
+
+
+def state_root() -> Path:
+    """Where the reporters keep their offsets, queue and spool. Regenerable: losing it
+    costs one full re-read and re-send, which the server's upsert absorbs."""
+    named = os.environ.get("AGENTS_USAGE_STATE_DIR", "").strip()
+    if named:
+        return Path(named)
+    cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    return (Path(cache) if cache else Path.home() / ".cache") / "agents-usage"
+
+
+def _key_of(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def write_json(path: Path, value) -> bool:
+    """Temp-and-rename, 0600: a reader never sees half a file, and a spooled body
+    names the account, the project and the device."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600) if hasattr(os, "fchmod") else None
+            json.dump(value, fh)
+        os.replace(temporary, path)
+        return True
+    except OSError as err:
+        log(f"write {path.name} failed: {err!r}")
+        return False
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def merge_bodies(older: dict, newer: dict) -> dict:
+    """
+    One report carrying both: every (model, bucket) entry, the NEWER total winning.
+
+    Every entry is a cumulative total, so for one key the newer reading is simply the
+    right one. Merging BEFORE sending is what keeps an older spooled total from being
+    delivered after a newer one and overwriting it with a smaller number.
+    """
+    entries = {}
+    for body in (older, newer):
+        for entry in body.get("models") or []:
+            entries[(entry.get("model"), entry.get("bucket", ""))] = entry
+    merged = dict(newer)
+    merged["models"] = [entries[k] for k in sorted(entries, key=lambda k: (str(k[1]), str(k[0])))]
+    return merged
+
+
+def deliver(config: dict, body: dict, spool: Path, user_agent: str = USER_AGENT) -> str:
+    """
+    Send one report, folding in whatever is spooled for the same session first, and
+    spool the lot when the platform cannot take it now. Returns the outcome.
+    """
+    parked = spool / f"{_key_of(str(body.get('sessionId')))}.json"
+    earlier = read_json(parked)
+    if isinstance(earlier, dict):
+        body = merge_bodies(earlier, body)
+    outcome = post_chunks(config, body, user_agent)
+    if outcome == "retry":
+        write_json(parked, body)
+    else:
+        try:
+            parked.unlink()
+        except OSError:
+            pass
+    return outcome
+
+
+def flush_spool(config: dict, spool: Path, user_agent: str = USER_AGENT) -> None:
+    """Resend what earlier runs could not deliver, oldest first; stop at the first
+    one the platform still cannot take — it is down, and the rest would fail too."""
+    try:
+        parked = sorted(spool.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    now = __import__("time").time()
+    tried = 0
+    for path in parked:
+        try:
+            if now - path.stat().st_mtime > SPOOL_MAX_AGE_S:
+                log(f"spool: {path.name} expired unsent")
+                path.unlink()
+                continue
+        except OSError:
+            continue
+        if tried >= SPOOL_FLUSH_MAX:
+            break
+        body = read_json(path)
+        if not isinstance(body, dict):
+            path.unlink(missing_ok=True)
+            continue
+        tried += 1
+        outcome = post_chunks(config, body, user_agent)
+        if outcome == "retry":
+            break
+        path.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------------------------
+# Incremental reporting: the offsets, and only what changed
+# ------------------------------------------------------------------------------------
+
+STATE_VERSION = 1
+
+
+def _dump_state(state: dict) -> dict:
+    return {
+        "version": STATE_VERSION,
+        "entrypoints": state["entrypoints"],
+        "files": state["files"],
+        "seen": sorted(state["seen"]),
+        "skipped": state["skipped"],
+        "cwd": state["cwd"],
+        "per_key": [[m, minute, totals] for (m, minute), totals in state["per_key"].items()],
+        "sent": state.get("sent", {}),
+    }
+
+
+def _load_state(raw, entrypoints: set):
+    """A saved state, or None when there is none or it was taken under other rules."""
+    if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
+        return None
+    if raw.get("entrypoints") != sorted(entrypoints):
+        return None  # the filter changed: the kept totals were counted by the old one
+    try:
+        return {
+            "entrypoints": raw["entrypoints"],
+            "files": dict(raw["files"]),
+            "seen": set(raw["seen"]),
+            "skipped": int(raw["skipped"]),
+            "cwd": str(raw["cwd"]),
+            "per_key": {(m, minute): dict(totals) for m, minute, totals in raw["per_key"]},
+            "sent": dict(raw.get("sent") or {}),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _sent_key(key: tuple) -> str:
+    return f"{key[0]}\x1f{key[1]}"
+
+
+def report_transcript(config: dict, session: str, transcript: Path, context: dict | None = None,
+                      root: Path | None = None) -> str:
+    """
+    Report one session INCREMENTALLY: read only the bytes written since the last run,
+    and send only the (model, minute) totals that changed. Returns the outcome, or
+    "idle" when nothing changed.
+
+    The cumulative contract is untouched. What is kept between runs is the FULL
+    running total per (model, minute), and a changed minute is sent as its whole
+    total, never as a delta — so the server's upsert converges exactly as it did when
+    every run re-read everything, a repeated send is still a no-op, and a lost state
+    file costs one full re-read and re-send and nothing else.
+
+    Only the reading moved. Re-parsing a long session and its subagents on every turn
+    took seconds (2.2s measured on one session), inside a hook the session waits on.
+    """
+    root = root or state_root() / "claude"
+    entrypoints = set(config["entrypoints"])
+    state_path = root / "state" / f"{_key_of(str(transcript.resolve()))}.json"
+    state = _load_state(read_json(state_path), entrypoints) or dict(new_state(entrypoints), sent={})
+    if not advance(state, transcript):
+        # Truncated or replaced: start over, and re-send all of it.
+        log(f"{transcript.name}: rewritten since the last read — re-reading it whole")
+        state = dict(new_state(entrypoints), sent={})
+        advance(state, transcript)
+    if state["skipped"]:
+        log(f"{transcript.name}: skipped {state['skipped']} record(s) from another entrypoint")
+
+    models = bucketize(state["per_key"])
+    changed = {k: v for k, v in models.items() if state["sent"].get(_sent_key(k)) != v}
+    outcome = "idle"
+    if changed:
+        body = body_of(config, session, changed, state["cwd"], context, cap=False)
+        outcome = deliver(config, body, root / "spool")
+        # Delivered, spooled or refused for good — either way this run is done with
+        # these totals: the spool now carries a retry, not the state.
+        for key, totals in changed.items():
+            state["sent"][_sent_key(key)] = totals
+    write_json(state_path, _dump_state(state))
+    return outcome
+
+
+# ------------------------------------------------------------------------------------
+# The hook: enqueue, detach, and one worker at a time
+# ------------------------------------------------------------------------------------
+
+def enqueue(root: Path, payload: dict, context: dict) -> bool:
+    """Park the hook's payload for the worker. Named by time so the queue drains in
+    the order the hooks fired."""
+    name = f"{__import__('time').time_ns():020d}-{os.getpid()}.json"
+    return write_json(root / "queue" / name, {"payload": payload, "context": context})
+
+
+def spawn_worker(script: Path) -> None:
+    """
+    Start `script --worker` detached, so the hook returns at once.
+
+    Its own session (process group) so the harness reaping the hook does not take the
+    worker with it; every stdio stream on /dev/null so nothing holds the hook's pipes
+    open behind it.
+    """
+    sp = subprocess
+    kwargs = {"stdin": sp.DEVNULL, "stdout": sp.DEVNULL, "stderr": sp.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(sp, "DETACHED_PROCESS", 0) | getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        sp.Popen([sys.executable, str(script), "--worker"], **kwargs)
+    except OSError as err:
+        log(f"could not start the worker: {err!r}")
+
+
+class WorkerLock:
+    """
+    `flock -n` on `<root>/worker.lock`: one worker per reporter at a time, and a
+    second one leaves at once instead of queueing behind the first.
+
+    No lost reports: whoever holds the lock drains the queue until it is empty, and
+    re-checks after letting go (see `run_worker`). Where `fcntl` does not exist
+    (Windows) there is no lock — two workers then only ever re-send the same
+    cumulative totals, which the upsert absorbs.
+    """
+
+    def __init__(self, root: Path, blocking: bool = False) -> None:
+        self.path = root / "worker.lock"
+        self.blocking = blocking
+        self.handle = None
+
+    def acquire(self) -> bool:
+        try:
+            import fcntl  # noqa: PLC0415
+        except ImportError:
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = open(self.path, "a+")  # noqa: SIM115
+            flags = fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB)
+            fcntl.flock(self.handle.fileno(), flags)
+            return True
+        except OSError:
+            if self.handle:
+                self.handle.close()
+                self.handle = None
+            return False
+
+    def release(self) -> None:
+        if self.handle:
+            self.handle.close()  # closing the descriptor drops the flock
+            self.handle = None
+
+
+def drain(root: Path, handle) -> int:
+    """Process every queued payload; returns how many. The newest payload per
+    transcript is all that matters — the report is cumulative — so repeats collapse."""
+    try:
+        items = sorted((root / "queue").glob("*.json"))
+    except OSError:
+        return 0
+    latest: dict = {}
+    for item in items:
+        queued = read_json(item)
+        try:
+            item.unlink()
+        except OSError:
+            pass
+        if not isinstance(queued, dict) or not isinstance(queued.get("payload"), dict):
+            continue
+        payload = queued["payload"]
+        where = str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
+        latest.pop(where, None)  # re-insert so the order stays "most recent last"
+        latest[where] = queued
+    for queued in latest.values():
+        try:
+            handle(queued["payload"], queued.get("context") or {})
+        except Exception as err:  # noqa: BLE001 - one bad session must not stop the rest
+            log(f"worker: {err!r}")
+    return len(items)
+
+
+def run_worker(root: Path, config: dict, handle, user_agent: str, rounds: int = 5) -> int:
+    """
+    Drain the queue behind the lock, then flush the spool.
+
+    `flock -n` alone loses the payload that lands just as the holder finishes: its own
+    worker found the lock taken and left, and the holder had already looked. So the
+    holder looks again after letting go, and goes round once more if anything arrived.
+    """
+    for _ in range(rounds):
+        lock = WorkerLock(root)
+        if not lock.acquire():
+            return 0
+        try:
+            drain(root, handle)
+            flush_spool(config, root / "spool", user_agent)
+        finally:
+            lock.release()
+        try:
+            if not any((root / "queue").glob("*.json")):
+                break
+        except OSError:
+            break
+    return 0
+
+
+def read_payload() -> dict:
+    payload = {}
+    if not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+            payload = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def hook_entry(root: Path, script: Path, payload: dict, context: dict, config: dict, handle,
+               user_agent: str) -> int:
+    """
+    The hook's whole job: queue the payload and hand it to a background worker.
+
+    It returns in milliseconds whatever the platform is doing — reading a long
+    transcript, a slow network, a platform that is down — where it used to hold the
+    session up to the hook's 10s timeout. `AGENTS_USAGE_SYNC=1` runs the worker in the
+    foreground instead (debugging, tests).
+    """
+    if not enqueue(root, payload, context):
+        return 0
+    if os.environ.get("AGENTS_USAGE_SYNC") == "1":
+        return run_worker(root, config, handle, user_agent)
+    spawn_worker(script)
+    return 0
 
 
 def transcripts_of(payload: dict, argv: list[str]) -> list[Path]:
@@ -987,44 +1511,58 @@ def transcripts_of(payload: dict, argv: list[str]) -> list[Path]:
     return [Path(path)] if path else []
 
 
+def handle_payload(config: dict):
+    """What the worker does with one queued hook payload."""
+    def handle(payload: dict, context: dict) -> None:
+        for transcript in transcripts_of(payload, []):
+            if transcript.is_file():
+                report_transcript(config, session_id_of(payload, transcript), transcript, context)
+    return handle
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--set-device" in argv:
         return device_command(argv)
     dry_run = "--print" in argv
+    root = state_root() / "claude"
 
-    payload = {}
-    if not sys.stdin.isatty():
-        try:
-            raw = sys.stdin.read()
-            payload = json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-
+    payload = {} if "--worker" in argv else read_payload()
     config = load_config()
-    if not dry_run and not (config["enabled"] and config["url"] and config["token"]):
-        log("skipped: not configured (need url + token, and enabled)")
+
+    if dry_run:
+        # A full, stateless read — what the session totals to right now.
+        for transcript in transcripts_of(payload, argv):
+            if not transcript.is_file():
+                continue
+            models, _skipped, cwd = tally(transcript, config["entrypoints"])
+            if models:
+                print(json.dumps(body_of(config, session_id_of(payload, transcript), models, cwd), indent=2))
         return 0
 
-    for transcript in transcripts_of(payload, argv):
-        if not transcript.is_file():
-            continue
-        models, skipped, cwd = tally(transcript, config["entrypoints"])
-        if skipped:
-            # Never silent: a sweep that quietly dropped most of its input reads as
-            # "there was nothing to report", which is the wrong conclusion entirely.
-            log(f"{transcript.name}: skipped {skipped} record(s) from another entrypoint")
-        if not models:
-            continue
-        body = body_of(config, session_id_of(payload, transcript), models, cwd)
-        if dry_run:
-            print(json.dumps(body, indent=2))
-            continue
-        post(config, body)
+    if not configured(config):
+        return 0
 
-    return 0
+    if "--worker" in argv:
+        return run_worker(root, config, handle_payload(config), USER_AGENT)
+
+    if "--backfill" in argv:
+        # A human at a terminal: synchronous, and it WAITS for a running worker rather
+        # than skipping, so the two never write one session's state at once.
+        lock = WorkerLock(root, blocking=True)
+        lock.acquire()
+        try:
+            context = hook_context()
+            for transcript in transcripts_of(payload, argv):
+                if transcript.is_file():
+                    report_transcript(config, session_id_of(payload, transcript), transcript, context)
+            flush_spool(config, root / "spool")
+        finally:
+            lock.release()
+        return 0
+
+    return hook_entry(root, Path(__file__).resolve(), payload, hook_context(), config,
+                      handle_payload(config), USER_AGENT)
 
 
 if __name__ == "__main__":
