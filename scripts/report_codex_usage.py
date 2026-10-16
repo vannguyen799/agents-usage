@@ -424,7 +424,7 @@ def main() -> int:
     root = state_root() / "codex"
     spool = root / "spool"
 
-    payload = {} if "--worker" in argv else read_payload()
+    payload = {} if "--worker" in argv or "--backfill" in argv else read_payload()
     config = load_config(CONFIG_PATH)
 
     if dry_run:

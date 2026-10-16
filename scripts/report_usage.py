@@ -53,7 +53,7 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 """The reporter's version, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -148,6 +148,9 @@ def load_config(preferred=None) -> dict:
         "enabled": enabled not in ("0", "false", "False"),
         "entrypoints": entrypoints,
         "device": os.environ.get("AGENTS_USAGE_DEVICE") or config.get("device") or "",
+        # Kept raw: the Codex reporter parses it (`originators()`), and dropping it here
+        # silently ignored the config file's list.
+        "originators": config.get("originators") or [],
     }
 
 
@@ -1538,7 +1541,9 @@ def main() -> int:
     dry_run = "--print" in argv
     root = state_root() / "claude"
 
-    payload = {} if "--worker" in argv else read_payload()
+    # A backfill takes no hook payload, and a caller that leaves stdin open without
+    # ever writing to it (a tool runner, a pipe) would otherwise hang the sweep.
+    payload = {} if "--worker" in argv or "--backfill" in argv else read_payload()
     config = load_config()
 
     if dry_run:
