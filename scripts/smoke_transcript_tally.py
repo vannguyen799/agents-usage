@@ -257,6 +257,7 @@ def counting_consume(state, mark, line, entrypoints):
 
 reporter._consume = counting_consume
 ledger = Ledger()
+REAL_POST_STATUS = reporter.post_status
 reporter.post_status = ledger
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory) / "state"
@@ -426,6 +427,63 @@ for code in (301, 302, 303, 307, 308):
           followed, False)
 check("…and the opener the reporter posts with is the one that refuses",
       any(isinstance(h, reporter._NoRedirect) for h in reporter._OPENER.handlers), True)
+
+print("\nwho paid: a subscription login is quota, an API key is money")
+import os  # noqa: E402
+saved = {k: os.environ.pop(k, None) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR")}
+real_account = reporter.claude_account_id
+try:
+    with tempfile.TemporaryDirectory() as directory:
+        os.environ["CLAUDE_CONFIG_DIR"] = directory   # an empty settings dir: no apiKeyHelper
+        reporter.claude_account_id = lambda: "me@example.com"
+        check("a subscription login and no key: quota", reporter.claude_billing(), "subscription")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-not-read"
+        check("a login AND a key: still quota — the approval that decides it is not read",
+              reporter.claude_billing(), "subscription")
+        reporter.claude_account_id = lambda: ""
+        check("a key and no subscription login: per call", reporter.claude_billing(), "api")
+        del os.environ["ANTHROPIC_API_KEY"]
+        check("neither: quota, as every report before 0.12.0", reporter.claude_billing(), "subscription")
+        (Path(directory) / "settings.json").write_text('{"apiKeyHelper": "~/bin/key.sh"}', encoding="utf-8")
+        check("an apiKeyHelper and no login: per call", reporter.claude_billing(), "api")
+finally:
+    reporter.claude_account_id = real_account
+    for k, v in saved.items():
+        os.environ.pop(k, None)
+        if v is not None:
+            os.environ[k] = v
+
+api = reporter.body_of(CONFIG, "sess", {(MODEL, MINUTE): {"promptTokens": 1, "completionTokens": 1, "calls": 1}},
+                       "", dict(CONTEXT, billing="api"))
+check("a per-call body names the vendor, says billing api, carries no account",
+      (api["provider"], api.get("billing"), api["accountId"]), ("anthropic", "api", ""))
+quota = reporter.body_of(CONFIG, "sess", {}, "", CONTEXT)
+check("a quota body is byte-for-byte what 0.11 sent — no billing key at all",
+      ("billing" in quota, quota["provider"]), (False, "claude-cli"))
+
+
+class Refusal:
+    """An opener whose server answers a 400 with the given body."""
+
+    def __init__(self, detail: bytes):
+        self.detail = detail
+
+    def open(self, request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", None, io.BytesIO(self.detail))
+
+
+real_opener = reporter._OPENER
+try:
+    reporter._OPENER = Refusal(b'{"error":"provider_not_supported:anthropic"}')
+    check("a server older than per-call billing refuses it — and the report is KEPT, not dropped",
+          REAL_POST_STATUS(CONFIG, api), "retry")
+    check("…while the same refusal of a quota body is still a drop",
+          REAL_POST_STATUS(CONFIG, quota), "drop")
+    reporter._OPENER = Refusal(b'{"error":"backend_not_supported:custom"}')
+    check("a NEW server refusing a per-call body for its own reasons is a drop as before",
+          REAL_POST_STATUS(CONFIG, api), "drop")
+finally:
+    reporter._OPENER = real_opener
 
 print()
 if FAILURES:

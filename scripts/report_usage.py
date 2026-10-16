@@ -53,7 +53,7 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 """The reporter's version, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -151,6 +151,8 @@ def load_config(preferred=None) -> dict:
         # Kept raw: the Codex reporter parses it (`originators()`), and dropping it here
         # silently ignored the config file's list.
         "originators": config.get("originators") or [],
+        # Kept raw for the Codex reporter: where a LiteLLM proxy's config lives.
+        "litellmConfig": config.get("litellmConfig") or "",
     }
 
 
@@ -631,6 +633,54 @@ def backend_of() -> tuple[str, str]:
     return "firstParty", ""
 
 
+# ------------------------------------------------------------------------------------
+# Billing: quota, or money (0.12.0)
+# ------------------------------------------------------------------------------------
+
+OFFICIAL_HOSTS = {"anthropic": "api.anthropic.com", "openai": "api.openai.com"}
+"""The vendors' own API hosts — the same list the server checks a `custom` backend
+against before it will price a per-call session on that vendor's rates."""
+
+API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+"""Where Claude Code takes an API key from the environment. Only PRESENCE is read."""
+
+
+def is_official(vendor: str, url: str) -> bool:
+    """Whether `url` is `vendor`'s own API host; an empty url is the vendor default."""
+    if not url:
+        return True
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower() == OFFICIAL_HOSTS.get(vendor)
+    except ValueError:
+        return False
+
+
+def claude_billing() -> str:
+    """
+    How THIS Claude Code is paid for — `subscription` (Pro/Max quota, the default and
+    everything before 0.12.0) or `api` (an API key, billed per call).
+
+    `api` only when it is unambiguous from what the hook can read cheaply: no
+    subscription login in `~/.claude.json` (`oauthAccount`) AND a key source — one of
+    `API_KEY_VARS` in the hook's environment, which is the session's, or an
+    `apiKeyHelper` in the user settings. A machine signed in to a subscription that
+    ALSO exports a key stays `subscription`: Claude Code uses such a key only once the
+    user approved it, and that approval is recorded against the key's own characters,
+    which this does not read. That case is reported as quota, exactly as before.
+    """
+    if claude_account_id():
+        return "subscription"
+    if any(os.environ.get(var, "").strip() for var in API_KEY_VARS):
+        return "api"
+    directory = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    settings = (Path(directory) if directory else Path.home() / ".claude") / "settings.json"
+    try:
+        helper = json.loads(settings.read_text(encoding="utf-8")).get("apiKeyHelper")
+    except (OSError, ValueError, AttributeError):
+        helper = None
+    return "api" if helper else "subscription"
+
+
 def safe_url(raw: str) -> str:
     """Scheme, host, port and path of a URL -- never its userinfo, query or fragment."""
     try:
@@ -987,6 +1037,21 @@ def body_of(config: dict, session: str, models: dict, cwd: str, context: dict | 
     """
     context = context or hook_context()
     backend = tuple(context.get("backend") or ("firstParty", ""))
+    if context.get("billing") == "api":
+        # Money, not quota: the VENDOR in `provider`, which a server older than 0.12.0
+        # refuses rather than filing it as `claude-cli` at $0 — see `post_status`.
+        return {
+            "sessionId": session,
+            "provider": "anthropic",
+            "billing": "api",
+            "accountId": "",
+            "project": project_of(cwd),
+            "device": device_of(config),
+            "backend": backend[0],
+            "baseUrl": backend[1],
+            "bucketSize": "minute",
+            "models": wire_models(models, cap),
+        }
     return {
         "sessionId": session,
         "provider": "claude-cli",
@@ -1002,7 +1067,7 @@ def body_of(config: dict, session: str, models: dict, cwd: str, context: dict | 
 
 def hook_context() -> dict:
     """The environment-derived fields of a report, read in the hook's own process."""
-    return {"backend": list(backend_of()), "account": claude_account_id()}
+    return {"backend": list(backend_of()), "account": claude_account_id(), "billing": claude_billing()}
 
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -1054,6 +1119,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 DROP_STATUSES = frozenset({400, 413, 422})
+
+OLD_SERVER_REFUSAL = re.compile(rb"(?<!api_)provider_not_supported:(?:anthropic|openai)")
+"""What a server from before per-call billing answers a `billing: 'api'` report with."""
 """Refusals that resending the same body can never turn into a success — the body
 itself is wrong. Anything else (a 5xx, 429, an expired token, a misconfigured URL
 answering 3xx, no answer at all) is spooled and tried again later."""
@@ -1090,7 +1158,15 @@ def post_status(config: dict, body: dict, user_agent: str = USER_AGENT) -> str:
             log(f"reported {session}: {response.status} {response.read(200)!r}")
             return "ok"
     except urllib.error.HTTPError as err:
-        log(f"reported {session}: HTTP {err.code} {err.read(200)!r}")
+        detail = err.read(200)
+        log(f"reported {session}: HTTP {err.code} {detail!r}")
+        if body.get("billing") == "api" and OLD_SERVER_REFUSAL.search(detail or b""):
+            # A server older than 0.12.0 does not know per-call billing and refuses the
+            # vendor in `provider` — the refusal that keeps it from filing the session
+            # as quota. Not the body's fault, so it is kept and sent again once the
+            # server is upgraded, instead of being dropped for good.
+            log(f"reported {session}: the platform predates per-call billing — kept for later")
+            return "retry"
         return "drop" if err.code in DROP_STATUSES else "retry"
     except (urllib.error.URLError, OSError, ValueError) as err:
         log(f"reported {session}: {err}")

@@ -296,9 +296,10 @@ hours are sent: the older minutes are final and went up with earlier reports.
 Sessions reported by 0.8.x stay hour-shaped until they report again; `--backfill
 <days>` re-reads recent transcripts and converts them.
 
-Rows land as `kind: cli`, `provider: claude-cli` or `codex-cli`, cost **$0**
-(subscription quota, not a bill), `conversationId` = the session id, and `accountId` =
-the login that spent it. They show up in the ledger and in the **By CLI account**
+Rows land as `kind: cli:claude` / `cli:codex`, `provider: claude-cli` or `codex-cli`,
+cost **$0** (subscription quota, not a bill), `conversationId` = the session id, and
+`accountId` = the login that spent it — or, for a session paid per call, as `kind:
+cli:api` under the vendor, priced by the platform (see [Quota or money](#quota-or-money-0120)). They show up in the ledger and in the **By CLI account**
 breakdown.
 
 Token counts are sent **split by rate class** — uncached input, cache read, 5-minute
@@ -377,20 +378,21 @@ the cent:
   `openai` as `codex-cli` — the subscriptions they spend. Anything else (OpenCode's
   own free models, OpenRouter, an API-key gateway) is skipped and logged under
   `AGENTS_USAGE_DEBUG`. A session that switched providers sends one body per provider.
-- **Only a subscription login is quota.** Those rows are filed at $0 as Pro/Max or
-  ChatGPT quota, so a provider is reported only while OpenCode's ACTIVE credential for
-  it is an OAuth login — read from the credential's `type` alone (2.0.29 keeps it in
-  the `value` JSON beside the secret; SQLite's `json_extract` pulls out `type` and
-  `methodID` and nothing else of `value` is ever selected). `oauth` is reported: the
-  ChatGPT login (`methodID` `chatgpt-token-sharing`), or a Claude Pro/Max login carried
-  over from OpenCode 1.x — 2.0.29 itself ships no Anthropic OAuth, so Anthropic in
-  OpenCode is usually an API key. An API key (`key`), no stored credential, any other
-  type (`external`, or one a later release adds), and an `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` in the environment of OpenCode's service (even beside an OAuth
-  login — which of the two was used is not recorded) are all skipped as "billed per
-  call, not subscription quota", under `AGENTS_USAGE_DEBUG`. Unknown means skip:
-  under-reporting can be backfilled once fixed, a pay-per-call session filed as
-  quota cannot be told apart from real quota afterwards.
+- **Who paid decides the row** — see [Quota or money](#quota-or-money-0120). Read from
+  the provider's ACTIVE credential, by its `type` alone (2.0.29 keeps it in the `value`
+  JSON beside the secret; SQLite's `json_extract` pulls out `type` and `methodID` and
+  nothing else of `value` is ever selected). `oauth` is QUOTA (`claude-cli` /
+  `codex-cli`): the ChatGPT login (`methodID` `chatgpt-token-sharing`), or a Claude
+  Pro/Max login carried over from OpenCode 1.x — 2.0.29 ships no Anthropic OAuth, so
+  Anthropic in OpenCode is usually an API key. `key` is MONEY (`anthropic` / `openai`,
+  `billing: "api"`), and so is an `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in the
+  environment of OpenCode's service when no credential is stored. Skipped, under
+  `AGENTS_USAGE_DEBUG`: an environment key BESIDE an OAuth login (which of the two
+  OpenCode used is not recorded), no credential and no key, `external` or any type a
+  later release adds. Unknown means skip: under-reporting can be backfilled once fixed,
+  a session filed under the wrong payer cannot be told apart afterwards. 0.12.0 drops
+  any 0.11 state once (`STATE_VERSION` 2), so the key-billed messages 0.11 skipped are
+  read again and reported.
 
   **The auth checked is the auth of NOW**, not of the moment a message was spent —
   OpenCode records no login against a message. Reports run at the end of every turn,
@@ -421,6 +423,61 @@ The session tree:
 
 `python3 scripts/smoke_opencode_tally.py` pins all of the above against a synthetic
 database.
+
+## Quota or money (0.12.0)
+
+Everything above files a session as SUBSCRIPTION QUOTA: `claude-cli` / `codex-cli`,
+cost $0, the login as the account. A session paid PER CALL — on an API key — spent
+money and no quota, and filing it as quota both hides the bill and inflates the quota
+view. Since 0.12.0 such a session is reported with **`billing: "api"`** and the
+**vendor** in `provider` (`anthropic` | `openai`); the platform files it as kind
+`cli:api`, with no account, and PRICES it itself from its own model price table — the
+reporter never sends a cost. A subscription report is unchanged, byte for byte.
+
+| Harness | Quota (`claude-cli` / `codex-cli`) | Money (`billing: "api"`) |
+|---|---|---|
+| Claude Code | a subscription login (`oauthAccount` in `~/.claude.json`) | NO such login, and an `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` in the hook's environment or an `apiKeyHelper` in `~/.claude/settings.json` |
+| Codex | the `openai` provider on a ChatGPT login (`auth_mode: chatgpt`) | `auth_mode: apikey`; or a **LiteLLM** provider, each model resolved through the proxy's config |
+| OpenCode | an `oauth` credential | a `key` credential, or an environment key with none stored |
+
+Read only for the TYPE, never a secret: `auth_mode` from Codex's `auth.json`, the
+presence of a variable, `json_extract` of OpenCode's credential type. Only presence of
+an API key variable is ever looked at.
+
+**Claude Code signed in to a subscription that ALSO exports a key** stays quota: Claude
+Code uses such a key only once the user approved it, and that approval is stored
+against the key's own characters, which this does not read. That is the one case still
+reported as it always was, and the place to look if a key-billed Claude Code shows up
+as quota.
+
+**Codex through a local LiteLLM proxy** (`model_provider` whose id or config.toml
+`name` says LiteLLM — on this machine most Codex sessions) is resolved from the proxy's
+OWN config, never from the model name: `AGENTS_USAGE_LITELLM_CONFIG`, `"litellmConfig"`
+in agents-usage.json, else `$CODEX_HOME/litellm.yaml` / `~/.config/litellm/config.yaml`.
+Each `model_list` entry's `litellm_params.model` names the vendor (`anthropic/…`,
+`openai/…`; a bare `claude…` / `gpt-…` is inferred) and the vendor's own model id,
+which is what is reported and priced — `gpt-6-luna` is `openai/gpt-6-luna` there,
+checked. Skipped and logged: a model the list does not route, one load-balanced across
+different upstreams, another prefix (`bedrock/`, `azure/`, … — a different tariff), an
+`api_base` that is not the vendor's own host, and a session with no proxy config to
+read. Values under a credential-looking key (`api_key`, …) are never read. Two caveats,
+both measured here: LiteLLM sends Codex no cache figures for these sessions
+(`cached_input_tokens` is 0 in every LiteLLM rollout on this machine, consistent with
+LiteLLM adding no `cache_control` unless configured), so the input is reported as
+uncached; and if cache WRITES ever occur through the proxy they arrive inside input
+and are priced at 1x rather than Anthropic's 1.25x/2x. The upstream key is assumed to
+be an API key — a proxy forwarding a subscription token would be mis-filed as money.
+
+**A server older than 0.12.0 refuses these reports** (`provider_not_supported:anthropic`)
+— by design: the vendor rides in `provider` so that an old server turns the report
+away rather than ignoring `billing` and filing it at $0 as quota. The reporter
+recognises that one refusal and SPOOLS the report (`<state>/<cli>/spool/`, 14 days)
+instead of dropping it, so it lands once the platform is upgraded. Deploy the server
+first all the same.
+
+The auth of every harness is the one of NOW, not of when the session was spent —
+none records it per response. Reports run at the end of every turn, so this only
+matters for a `--backfill` across a login change.
 
 ## Running this on the same host as the platform
 
@@ -486,7 +543,8 @@ reporting machine, this is the place that needs a filter.
   CLI, every OS user and every reinstall on that box. It is
   only a label either way: multi-device accounting is already correct without it,
   because the upsert key carries a session UUID that no two machines can collide on.
-- `accountId` — the Claude login's e-mail from `~/.claude.json`, or the ChatGPT
+- `accountId` — empty on a per-call report (`billing: "api"`): it names whose QUOTA a
+  session spent, and a key-billed one spent none. Otherwise the Claude login's e-mail from `~/.claude.json`, or the ChatGPT
   `account_id` from `~/.codex/auth.json`. For OpenCode, the e-mail of the OpenCode
   login (the `account` table's `email` column, nothing else from it — the same table
   holds that login's tokens, and `credential` the provider keys; neither is read).

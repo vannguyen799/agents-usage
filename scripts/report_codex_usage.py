@@ -47,8 +47,19 @@ THE FOUR TRAPS THIS AVOIDS
        and independent guard; this filter is what makes the two safe to run on one
        host by construction rather than by coincidence.
 
+QUOTA OR MONEY (0.12.0)
+    Only a ChatGPT login spends quota. Codex on an API key (`auth_mode: "apikey"`
+    in auth.json), and Codex pointed at a LOCAL LITELLM PROXY that forwards each
+    model to a vendor on that vendor's API key, spend money — reported with
+    `billing: "api"` and the VENDOR in `provider`, which the server prices from its
+    own table. Through LiteLLM the vendor and the vendor's model id are read from
+    the proxy's own config (`model_list`), never guessed from the name; a model it
+    does not route, routes ambiguously, or routes to a host other than the vendor's
+    own is skipped and logged. See `routes_of`.
+
 Never fails a session: every error path exits 0 and stays quiet.
 """
+import fnmatch
 import json
 import os
 import re
@@ -58,8 +69,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from report_usage import (  # noqa: E402  (path first — a hook has no package to import from)
     VERSION, WorkerLock, bucketize, configured, deliver, device_command, device_of,
-    flush_spool, hook_entry, load_config, log, minute_of, num, path_label, project_of,
-    read_payload, run_worker, safe_url, slug_of, state_root, wire_models,
+    flush_spool, hook_entry, is_official, load_config, log, minute_of, num, path_label,
+    project_of, read_payload, run_worker, safe_url, slug_of, state_root, wire_models,
 )
 
 USER_AGENT = f"agents-usage/{VERSION} (codex-cli-hook)"
@@ -139,6 +150,136 @@ def backend_of(model_provider: str) -> tuple:
         return "custom", ""
     override = os.environ.get("OPENAI_BASE_URL", "").strip() or config_base_url()
     return ("custom", safe_url(override)) if override else ("firstParty", "")
+
+
+def codex_auth_mode() -> str:
+    """`auth_mode` from auth.json — `chatgpt` (a subscription login) or `apikey` — and
+    nothing else from that file: it also holds the tokens, which are never read."""
+    try:
+        auth = json.loads((CODEX_HOME / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(auth.get("auth_mode") or "").strip().lower() if isinstance(auth, dict) else ""
+
+
+def codex_config() -> dict:
+    """config.toml parsed, or {} — only `model_providers` is read from it (by id and
+    `name`), never an `auth` / header block."""
+    try:
+        import tomllib
+        return tomllib.loads((CODEX_HOME / "config.toml").read_text(encoding="utf-8"))
+    except Exception:  # no tomllib (3.10), no file, or a config this has no business rejecting
+        return {}
+
+
+def is_litellm(model_provider: str) -> bool:
+    """Whether Codex's `model_provider` is a LiteLLM proxy — by its id or the `name`
+    config.toml gives it (`[model_providers.litellm] name = "LiteLLM"`)."""
+    if "litellm" in model_provider.lower():
+        return True
+    entry = (codex_config().get("model_providers") or {}).get(model_provider)
+    return isinstance(entry, dict) and "litellm" in str(entry.get("name") or "").lower()
+
+
+LITELLM_VENDORS = {"anthropic": "anthropic", "openai": "openai"}
+"""LiteLLM's provider prefix (`anthropic/claude-…`) -> the vendor that bills it. Every
+other prefix (azure, bedrock, vertex_ai, openrouter, …) is a different tariff and is
+skipped rather than priced on the vendor's list price."""
+
+SECRET_KEY_RE = re.compile(r"key|secret|token|password|auth", re.IGNORECASE)
+
+
+def litellm_config_path(config: dict):
+    """Where the proxy's own config is: `AGENTS_USAGE_LITELLM_CONFIG`, `litellmConfig`
+    in agents-usage.json, else the usual places — beside Codex's config first."""
+    named = os.environ.get("AGENTS_USAGE_LITELLM_CONFIG", "").strip() or str(config.get("litellmConfig") or "").strip()
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", "").strip() or Path.home() / ".config")
+    candidates = [Path(named).expanduser()] if named else [
+        CODEX_HOME / "litellm.yaml", CODEX_HOME / "litellm.yml",
+        xdg / "litellm" / "config.yaml", xdg / "litellm" / "config.yml", xdg / "litellm" / "litellm.yaml",
+    ]
+    return next((c for c in candidates if c.is_file()), None)
+
+
+def litellm_routes(text: str) -> dict:
+    """
+    `model_list` of a LiteLLM config -> `{model_name: [(vendor, vendor_model, api_base)]}`.
+
+    A reader for the one block that matters rather than a YAML parser — the plugin
+    promises the standard library and nothing else. It takes each list item's flat
+    `key: value` pairs at any depth (`model_name`, `litellm_params.model`, `api_base`),
+    which is the shape LiteLLM documents, and keeps no value whose KEY looks like a
+    credential (`api_key`, …): those are never read into anything.
+
+    A `vendor` of None is a model routed somewhere this does not price (another
+    prefix, or one it cannot infer); `routes_of` skips it.
+    """
+    entries, current, item_indent, in_list = [], None, None, False
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = line.strip()
+        if indent == 0:
+            in_list, current, item_indent = body.startswith("model_list:"), None, None
+            continue
+        if not in_list:
+            continue
+        if body.startswith("- "):
+            item_indent = indent if item_indent is None else item_indent
+            if indent == item_indent:
+                current = {}
+                entries.append(current)
+            body = body[2:].strip()
+        if current is None:
+            continue
+        key, sep, value = body.partition(":")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if sep and value and not SECRET_KEY_RE.search(key) and key not in current:
+            current[key] = value
+
+    routes: dict = {}
+    for entry in entries:
+        name, target = entry.get("model_name", ""), entry.get("model", "")
+        if not name or not target:
+            continue
+        prefix, slash, rest = target.partition("/")
+        if slash:
+            vendor, vendor_model = LITELLM_VENDORS.get(prefix.lower()), rest
+        else:
+            # LiteLLM infers the provider from a bare name; so does this, for the two
+            # families it can be sure of.
+            lowered = target.lower()
+            vendor = "anthropic" if lowered.startswith("claude") else \
+                "openai" if re.match(r"(gpt-|chatgpt|o\d)", lowered) else None
+            vendor_model = target
+        base = entry.get("api_base") or entry.get("base_url") or ""
+        routes.setdefault(name, []).append((vendor, vendor_model, base))
+    return routes
+
+
+def resolve_litellm(routes: dict, model: str):
+    """`(vendor, vendor_model, api_base)` for a model Codex asked the proxy for, or
+    `(None, why)`. A `model_name` LiteLLM load-balances across deployments resolves
+    only when every deployment is the same vendor, model and host."""
+    targets = routes.get(model)
+    if targets is None:
+        for name, wild in routes.items():
+            if "*" in name and fnmatch.fnmatchcase(model, name):
+                targets = [(v, model if "*" in m else m, b) for v, m, b in wild]
+                break
+    if not targets:
+        return None, "not in the LiteLLM model_list"
+    distinct = set(targets)
+    if len(distinct) != 1:
+        return None, "routed to more than one upstream"
+    vendor, vendor_model, base = distinct.pop()
+    if not vendor:
+        return None, "routed to a provider whose tariff is not the vendor's"
+    if not is_official(vendor, base):
+        return None, f"routed to {safe_url(base) or 'an unreadable api_base'}, not {vendor}'s own API"
+    return (vendor, vendor_model.strip(), base), ""
 
 
 def config_base_url() -> str:
@@ -276,6 +417,7 @@ def tally(rollout: Path, accepted: set) -> dict:
         "sessionId": str(meta.get("session_id") or meta.get("id") or "").strip(),
         "project": project_from(meta),
         "backend": backend_of(str(meta.get("model_provider") or "")),
+        "modelProvider": str(meta.get("model_provider") or ""),
         "models": bucketize(per_key),
     }
 
@@ -369,20 +511,89 @@ def rollouts_of(payload: dict, argv: list) -> list:
     return [Path(path)]
 
 
-def body_of(config: dict, session: dict, fallback_id: str) -> dict:
-    """The wire shape — built in ONE place so `--print` cannot drift from what is sent."""
-    backend = session["backend"]
-    return {
-        "sessionId": session["sessionId"] or fallback_id,
-        "provider": "codex-cli",
-        "accountId": codex_account_id(),
+def routes_of(config: dict, session: dict) -> list:
+    """
+    Who paid for this session, as one ROUTE per body to send:
+    `{provider, billing, backend, models}`.
+
+    - a ChatGPT login (the `openai` provider, `auth_mode: chatgpt`): `codex-cli`
+      quota, exactly as before 0.12.0;
+    - the `openai` provider on an API key (`auth_mode: apikey`): `openai`, per call;
+    - a LiteLLM proxy: each model resolved through the proxy's config to the vendor
+      and the vendor's own model id, one body per vendor; unresolvable models skipped;
+    - anything else: as before — a `custom` backend, which the server refuses rather
+      than weigh on a tariff it does not have.
+
+    The auth mode is the one of NOW, not of when the rollout was written — the rollout
+    does not record it.
+    """
+    provider_id = session.get("modelProvider", "")
+    models = session["models"]
+    if provider_id == NATIVE_PROVIDER and codex_auth_mode() == "apikey":
+        return [{"provider": "openai", "billing": "api", "backend": session["backend"], "models": models}]
+    if provider_id and is_litellm(provider_id):
+        path = litellm_config_path(config)
+        try:
+            routes = litellm_routes(path.read_text(encoding="utf-8")) if path else None
+        except OSError:
+            routes = None
+        if routes is None:
+            log(f"{session['sessionId']}: LiteLLM session, but no LiteLLM config found — skipped "
+                "(set AGENTS_USAGE_LITELLM_CONFIG)")
+            return []
+        by_vendor: dict = {}
+        for (model, minute), totals in models.items():
+            target, why = resolve_litellm(routes, model)
+            if not target:
+                log(f"{session['sessionId']}: skipped {model} — {why}")
+                continue
+            vendor, vendor_model, base = target
+            route = by_vendor.setdefault(vendor, {
+                "provider": vendor, "billing": "api",
+                "backend": ("custom", safe_url(base)) if base else ("firstParty", ""), "models": {}})
+            fold(route["models"], (vendor_model, minute), totals)
+        return list(by_vendor.values())
+    return [{"provider": "codex-cli", "billing": None, "backend": session["backend"], "models": models}]
+
+
+def fold(into: dict, key: tuple, totals: dict) -> None:
+    """Two proxy names for one vendor model land on ONE (model, minute) entry: the server
+    folds them anyway, and a report should not rely on it."""
+    entry = into.get(key)
+    if entry is None:
+        into[key] = dict(totals)
+        return
+    for field, value in totals.items():
+        if field == "startedAt":
+            entry[field] = min(entry.get(field) or value, value)
+        elif field == "endedAt":
+            entry[field] = max(entry.get(field) or value, value)
+        else:
+            entry[field] = entry.get(field, 0) + value
+
+
+def body_of(config: dict, session: dict, fallback_id: str, route: dict | None = None) -> dict:
+    """The wire shape — built in ONE place so `--print` cannot drift from what is sent.
+    `route` is one of `routes_of`; none is the subscription body this always sent."""
+    route = route or {"provider": "codex-cli", "billing": None, "backend": session["backend"],
+                      "models": session["models"]}
+    body = {"sessionId": session["sessionId"] or fallback_id, "provider": route["provider"]}
+    if route["billing"]:
+        # A vendor in `provider` is what a server older than 0.12.0 REFUSES — so a per-call
+        # session can never be filed there as quota. See report_usage.post_status.
+        body["billing"] = route["billing"]
+    backend = route["backend"]
+    body.update({
+        # Whose quota — which a per-call session spent none of.
+        "accountId": "" if route["billing"] else codex_account_id(),
         "project": session["project"],
         "device": device_of(config),
         "backend": backend[0],
         "baseUrl": backend[1],
         "bucketSize": "minute",
-        "models": wire_models(session["models"]),
-    }
+        "models": wire_models(route["models"]),
+    })
+    return body
 
 
 def session_id_of(payload: dict, rollout: Path) -> str:
@@ -407,13 +618,17 @@ def report_rollout(config: dict, payload: dict, rollout: Path, spool: Path, dry_
     session = tally(rollout, originators(config))
     if not session:
         return
-    body = body_of(config, session, session_id_of(payload, rollout))
-    if not body["sessionId"]:
-        return
-    if dry_run:
-        print(json.dumps(body, indent=2))
-        return
-    deliver(config, body, spool, USER_AGENT)
+    for route in routes_of(config, session):
+        body = body_of(config, session, session_id_of(payload, rollout), route)
+        if not body["sessionId"] or not body["models"]:
+            continue
+        if dry_run:
+            print(json.dumps(body, indent=2))
+            continue
+        # Spooled per (session, payer): a session that ran on two vendors through the
+        # proxy is two bodies, and merging them would file one under the other.
+        deliver(config, body, spool, USER_AGENT,
+                spool_key=f"{body['sessionId']}:{body['provider']}" if route["billing"] else None)
 
 
 def main() -> int:

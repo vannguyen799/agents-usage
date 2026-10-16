@@ -252,6 +252,88 @@ print("\nthe wire")
 check("the report says its buckets are minutes",
       reporter.body_of(reporter.load_config(), session, "s")["bucketSize"], "minute")
 
+print("\nwho paid: a ChatGPT login is quota, a key or a LiteLLM proxy is money")
+LITELLM_YAML = """
+model_list:
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY_   # a credential reference: never read
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: openai/gpt-6-luna
+      api_key: "sk-SECRET"
+  - model_name: bare-claude
+    litellm_params:
+      model: claude-haiku-5-5
+  - model_name: on-bedrock
+    litellm_params:
+      model: bedrock/anthropic.claude-opus-5-5
+  - model_name: via-gateway
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_base: https://gateway.example.com
+  - model_name: balanced
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+  - model_name: balanced
+    litellm_params:
+      model: openai/gpt-6-luna
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/*"
+litellm_settings:
+  drop_params: true
+"""
+routes = reporter.litellm_routes(LITELLM_YAML)
+check("no value under a credential-looking key is kept",
+      "SECRET" in repr(routes) or "os.environ" in repr(routes), False)
+check("a prefixed model resolves to its vendor and the vendor's own id",
+      reporter.resolve_litellm(routes, "claude-sonnet-5-5")[0], ("anthropic", "claude-sonnet-5-5", ""))
+check("gpt-6-luna is what the proxy says it is: openai",
+      reporter.resolve_litellm(routes, "gpt-6-luna")[0], ("openai", "gpt-6-luna", ""))
+check("a bare name is inferred for the two families that can be",
+      reporter.resolve_litellm(routes, "bare-claude")[0], ("anthropic", "claude-haiku-5-5", ""))
+check("a wildcard route passes the asked-for model through",
+      reporter.resolve_litellm(routes, "claude-fable-5-1")[0], ("anthropic", "claude-fable-5-1", ""))
+for name, why in [("on-bedrock", "tariff"), ("via-gateway", "not anthropic's own"),
+                  ("balanced", "more than one"), ("nowhere", "model_list")]:
+    got = reporter.resolve_litellm(routes, name)
+    check(f"{name}: skipped, never priced as the vendor ({why})", got[0] is None and why in got[1], True)
+
+with tempfile.TemporaryDirectory() as home:
+    reporter.CODEX_HOME = Path(home)
+    (Path(home) / "litellm.yaml").write_text(LITELLM_YAML, encoding="utf-8")
+    (Path(home) / "config.toml").write_text('[model_providers.proxy]\nname = "LiteLLM"\n', encoding="utf-8")
+
+    def routed(records, auth_mode="chatgpt"):
+        (Path(home) / "auth.json").write_text(json.dumps({"auth_mode": auth_mode, "tokens": {"access_token": "SECRET"}}))
+        session = tally(records)
+        return [(r["provider"], r["billing"], sorted(k[0] for k in r["models"]))
+                for r in reporter.routes_of(reporter.load_config(), session)], session
+
+    got, _ = routed([meta(), turn("gpt-5.6-terra"), tokens(100, 0, 10)])
+    check("a ChatGPT login: codex-cli quota, exactly as before", got, [("codex-cli", None, ["gpt-5.6-terra"])])
+    got, _ = routed([meta(), turn("gpt-5.6-terra"), tokens(100, 0, 10)], auth_mode="apikey")
+    check("the openai provider on an API key: per call, under openai", got, [("openai", "api", ["gpt-5.6-terra"])])
+    got, session = routed([meta(model_provider="proxy"), turn("claude-sonnet-5-5"), tokens(100, 0, 10),
+                           turn("gpt-6-luna"), tokens(300, 0, 30), turn("on-bedrock"), tokens(400, 0, 40)])
+    check("a LiteLLM session (by its config.toml name): one per-call body per vendor, the rest skipped",
+          sorted(got), [("anthropic", "api", ["claude-sonnet-5-5"]), ("openai", "api", ["gpt-6-luna"])])
+    route = next(r for r in reporter.routes_of(reporter.load_config(), session) if r["provider"] == "anthropic")
+    body = reporter.body_of(reporter.load_config(), session, "s", route)
+    check("the per-call body: vendor, billing api, no account, first-party backend",
+          (body["provider"], body["billing"], body["accountId"], body["backend"]),
+          ("anthropic", "api", "", "firstParty"))
+    check("a quota body carries no billing key — byte-for-byte what 0.11 sent",
+          "billing" in reporter.body_of(reporter.load_config(), tally([meta(), turn("gpt-5.6-terra"), tokens(1, 0, 1)]), "s"),
+          False)
+    (Path(home) / "litellm.yaml").unlink()
+    got, _ = routed([meta(model_provider="litellm"), turn("claude-sonnet-5-5"), tokens(100, 0, 10)])
+    check("a LiteLLM session with no proxy config to read: skipped, not guessed from the name", got, [])
+    got, _ = routed([meta(model_provider="ollama"), turn("llama"), tokens(100, 0, 10)])
+    check("any other provider: as before — custom, for the server to refuse", got, [("codex-cli", None, ["llama"])])
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

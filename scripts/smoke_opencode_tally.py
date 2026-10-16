@@ -122,7 +122,7 @@ def tally(db: Db, session: str, env_keys: dict = None) -> dict:
     """Full, stateless read: {provider: {(model, minute): counts}} with spans stripped."""
     with reporter.open_db(db.path) as conn:
         state = reporter.new_state()
-        auth = reporter.subscriptions(conn, env_keys or {})
+        auth = reporter.payers(conn, env_keys or {})
         reporter.advance(conn, state, reporter.root_of(conn, session), auth)
     return {p: {k: {f: v for f, v in t.items() if f not in ("startedAt", "endedAt")} for k, t in per.items()}
             for p, per in reporter.tallies(state).items()}
@@ -173,7 +173,7 @@ with tempfile.TemporaryDirectory() as directory:
     db.message("msg_3", "ses_m", "2026-10-15T13:40:00", input_tokens=40, output=4)
     with reporter.open_db(db.path) as conn:
         state = reporter.new_state()
-        reporter.advance(conn, state, "ses_m", reporter.subscriptions(conn, {}))
+        reporter.advance(conn, state, "ses_m", reporter.payers(conn, {}))
     per = reporter.tallies(state)["claude-cli"]
     check("one session spanning two hours is two minute rows",
           {k: v["promptTokens"] for k, v in per.items()},
@@ -199,39 +199,59 @@ with tempfile.TemporaryDirectory() as directory:
     check("…and the skipped provider's tokens are nowhere",
           sum(v["promptTokens"] for per in got.values() for v in per.values()), 60)
 
-    print("\nonly a subscription login is quota")
+    print("\nwho paid: a subscription login is quota, an API key is money")
     def mixed(logins):
         db = Db(tmp / f"auth-{len(list(tmp.iterdir()))}", logins)
         db.session("ses_x", "2026-10-15T12:00:00")
-        db.message("msg_1", "ses_x", "2026-10-15T12:05:00", input_tokens=10, output=1)
-        db.message("msg_2", "ses_x", "2026-10-15T12:05:30", model=GPT, input_tokens=20, output=2)
+        db.message("msg_1", "ses_x", "2026-10-15T12:05:00", input_tokens=10, output=1, write=7)
+        db.message("msg_2", "ses_x", "2026-10-15T12:05:30", model=GPT, input_tokens=20, output=2, write=3)
         return db
-    check("an OAuth login on both: both reported",
+    KEY = {"type": "key", "key": "SECRET-K"}
+    check("an OAuth login on both: both filed as the CLI's quota",
           sorted(tally(mixed(OAUTH), "ses_x")), ["claude-cli", "codex-cli"])
-    check("an Anthropic API KEY (what this box has): Anthropic skipped, the ChatGPT login kept",
-          sorted(tally(mixed({"anthropic": {"type": "key", "key": "SECRET-K"}, "openai": OAUTH["openai"]}), "ses_x")),
-          ["codex-cli"])
-    check("no credential stored at all: nothing reported",
+    got = tally(mixed({"anthropic": KEY, "openai": OAUTH["openai"]}), "ses_x")
+    check("an Anthropic API KEY (what this box has): filed under the VENDOR, beside the ChatGPT quota",
+          sorted(got), ["anthropic", "codex-cli"])
+    check("…with Anthropic's five classes, the write a 5-minute one",
+          got["anthropic"][("claude-opus-5-5", "2026-10-15T12:05")]["cacheWrite5mTokens"], 7)
+    got = tally(mixed({"openai": KEY}), "ses_x")
+    check("an OpenAI key: `openai`, the write folded into input as OpenAI bills it",
+          (sorted(got), got["openai"][("gpt-5.6-terra", "2026-10-15T12:05")]["promptTokens"]),
+          (["openai"], 23))
+    check("no credential stored and no key in the environment: nothing reported",
           tally(mixed({}), "ses_x"), {})
+    check("no credential but a key in the service's environment: per call",
+          sorted(tally(mixed({}), "ses_x", env_keys={"anthropic": True})), ["anthropic"])
     check("a type this release does not know (or `external`): skipped",
           tally(mixed({"anthropic": {"type": "external", "methodID": "x"},
                        "openai": {"type": "wormhole"}}), "ses_x"), {})
-    check("an API key in the service's environment beats an OAuth login",
+    check("an environment key BESIDE an OAuth login is ambiguous: skipped, not guessed",
           sorted(tally(mixed(OAUTH), "ses_x", env_keys={"anthropic": True})), ["codex-cli"])
-    db = mixed({"anthropic": {"type": "key", "key": "SECRET-K"}})
+    db = mixed({"anthropic": KEY})
     db.credential("anthropic", OAUTH["anthropic"], active=0)
     check("the ACTIVE credential decides, not any credential",
-          tally(db, "ses_x"), {})
+          sorted(tally(db, "ses_x")), ["anthropic"])
     with reporter.open_db(db.path) as conn:
         statements = []
         conn.set_trace_callback(statements.append)
-        verdict = reporter.subscriptions(conn, {})
-    check("…and says why, for the debug log", verdict["claude-cli"],
-          "billed per call, not subscription quota (anthropic signs in with an API key)")
+        verdict = reporter.payers(conn, {})
+    check("…and says why a provider is skipped, for the debug log", verdict["openai"],
+          (None, "no openai login stored and no OPENAI_API_KEY"))
     selected = " ".join(statements).replace("json_extract(value, '$.type')", "") \
         .replace("json_extract(value, '$.methodID')", "")
     check("the credential's `value` is never selected whole — only its type and methodID",
           "value" in selected, False)
+
+    print("\nthe per-call wire")
+    ledger_api = Ledger()
+    shared.post_status = ledger_api
+    db = mixed({"anthropic": KEY})
+    reporter.report_session(CONFIG, "ses_x", CONTEXT, tmp / "api-state", db.path)
+    body = ledger_api.posts[0]
+    check("says billing api and names the vendor — what an old server refuses",
+          (body["provider"], body.get("billing"), body["accountId"]), ("anthropic", "api", ""))
+    check("a quota body carries no billing key at all — byte-for-byte what 0.11 sent",
+          "billing" in reporter.body_of(CONFIG, "s", "claude-cli", {}, "", "a@b", CONTEXT), False)
 
     print("\nsubagents fold into the session that spawned them")
     db = Db(tmp / "tree")
@@ -319,7 +339,7 @@ with tempfile.TemporaryDirectory() as directory:
                                                            "2026-10-15T12:05:00Z")]["promptTokens"], 10)
     with reporter.open_db(db.path) as conn:
         full = reporter.new_state()
-        reporter.advance(conn, full, "ses_i", reporter.subscriptions(conn, {}))
+        reporter.advance(conn, full, "ses_i", reporter.payers(conn, {}))
     expected = {("ses_i", e["model"], e["bucket"]): {k: v for k, v in e.items() if k not in ("model", "bucket")}
                 for e in shared.wire_models(reporter.tallies(full)["claude-cli"], cap=False)}
     check("after every increment the platform holds the full re-read's rows (bar the reverted one)",
