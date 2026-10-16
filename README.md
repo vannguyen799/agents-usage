@@ -1,12 +1,13 @@
 # agents-usage
 
-Reports **this machine's Claude Code and Codex CLI token usage** into the agent
-platform's usage ledger, so `/usage` shows a subscription's whole quota burn — not
-just the half the platform spent itself.
+Reports **this machine's Claude Code, Codex CLI and OpenCode token usage** into the
+agent platform's usage ledger, so `/usage` shows a subscription's whole quota burn —
+not just the half the platform spent itself.
 
 The platform meters agents that run on its `claude-cli` and `codex-cli` providers. A
 human typing into either CLI on the same login spends the same Pro/Max/Plus quota and
-the platform sees none of it. This plugin closes that gap, for both, from one install.
+the platform sees none of it — and so does OpenCode signed in to Anthropic or OpenAI.
+This plugin closes that gap, for all three, from one install.
 
 ## Install
 
@@ -33,9 +34,32 @@ plugin. Re-running it is how you change one answer: everything is a no-op when i
 already done, and answering "keep" to the token question leaves the one on disk
 untouched — which is also how a machine moves to a rotated key.
 
-`--platform claude|codex|both` · `--source github|local` · `--device LABEL` · `--yes`.
-`--source local` installs the working tree instead of GitHub, so it needs the repo on
-disk and is refused down a pipe.
+`--platform claude|codex|opencode` (comma-separated for several, e.g.
+`claude,opencode`) · `--source github|local` · `--device LABEL` · `--yes`. `both` still
+means `claude,codex`, exactly as before; `all` means every one of the three that is
+installed on this machine, so one fleet command fits every box. `--source local`
+installs the working tree instead of GitHub, so it needs the repo on disk and is
+refused down a pipe.
+
+### OpenCode
+
+OpenCode (2.x) has no marketplace and no shell hooks: a plugin is a `.js` file in
+`${XDG_CONFIG_HOME:-~/.config}/opencode/plugin/`, loaded by OpenCode's background
+service. `install.sh --platform opencode` **links** `opencode/agents-usage.js` there
+— a symlink, not a copy, because the plugin finds its reporter by following the link
+back (`../scripts/report-opencode-usage.sh`), so whatever keeps that checkout current
+updates both at once. Which checkout:
+
+- `--source local` — this working tree; a `git pull` here is the update.
+- `--source github` with Claude Code also installed — the marketplace clone Claude Code
+  keeps current itself (`~/.claude/plugins/marketplaces/vt-plugins`, `autoUpdate`).
+- `--source github` without it — a clone of its own in
+  `${XDG_DATA_HOME:-~/.local/share}/agents-usage`, which re-running the installer pulls.
+
+The running service picks the file up by itself — no restart, nothing interrupted —
+and `opencode plugin list` shows `agents-usage  local`. Nothing else in
+`~/.config/opencode/` is touched — save `agents-usage.json` itself, on a machine where
+OpenCode is the only CLI and no config exists yet.
 
 ### By hand
 
@@ -81,7 +105,13 @@ The hooks are two lines of settings. Point them at the script in your clone:
 }
 ```
 
-The same shape works in `~/.codex/hooks.json` with `report-codex-usage.sh`.
+The same shape works in `~/.codex/hooks.json` with `report-codex-usage.sh`. For
+OpenCode it is one link:
+
+```bash
+mkdir -p ~/.config/opencode/plugin
+ln -s /home/you/agents-usage/opencode/agents-usage.js ~/.config/opencode/plugin/
+```
 
 ## Configure
 
@@ -99,12 +129,16 @@ JSON
 chmod 600 ~/.claude/agents-usage.json
 ```
 
-ONE file serves both reporters — the credential belongs to the platform, not to a CLI
+ONE file serves every reporter — the credential belongs to the platform, not to a CLI
 — and each looks in its own CLI's directory first: `~/.codex/agents-usage.json` then
-`~/.claude/agents-usage.json` for Codex, the other way round for Claude Code. A machine
-with both CLIs therefore needs only one file, and installing Codex on a machine that
-still carries a stale Claude Code config reports with the token just written rather
-than silently with the old one. `AGENTS_USAGE_CONFIG` overrides both.
+`~/.claude/agents-usage.json` for Codex, the other way round for Claude Code, and
+`${XDG_CONFIG_HOME:-~/.config}/opencode/agents-usage.json` first for OpenCode (then
+the other two; the others try it last). A machine with several CLIs therefore needs
+only one file, and installing Codex on a machine that still carries a stale Claude
+Code config reports with the token just written rather than silently with the old
+one. `AGENTS_USAGE_CONFIG` overrides all of them. Re-running the installer for one
+more CLI while answering "keep" to the token edits the file that already holds it —
+and leaves it alone entirely when no answer changed.
 
 Mint the key in the platform UI, on **/usage → "Report a machine"** — the panel also
 prints the whole install as one line with the secret already in it. Anyone signed in
@@ -146,9 +180,9 @@ scripts/report_usage.py --set-device --id     # use this machine's opaque id ins
 scripts/report_usage.py --set-device ''       # back to user@host
 ```
 
-It writes `device` into the config file both reporters read, so naming the machine
-once names it for every CLI on it — `report_codex_usage.py` takes the same flag and
-answers the same. `AGENTS_USAGE_DEVICE` still wins over the file, for one shell.
+It writes `device` into the config file every reporter reads, so naming the machine
+once names it for every CLI on it — `report_codex_usage.py` and
+`report_opencode_usage.py` take the same flag and answer the same. `AGENTS_USAGE_DEVICE` still wins over the file, for one shell.
 
 `--id` is for a box that must not report its login and hostname. The id is this
 plugin's own, kept as `deviceId` in that same shared config — deliberately not Claude
@@ -171,9 +205,10 @@ session would file every session as a separate device.
 
 ## How it works
 
-Two hooks (`Stop`, `SessionEnd`) in each CLI run one script. It re-reads the session
-transcript, sums tokens per model **and hour**, and POSTs the **cumulative** total to
-`POST /api/v1/usage/sessions`. The server upserts on `cli:<sessionId>:<model>:<hour>`.
+Two hooks (`Stop`, `SessionEnd`) in Claude Code and Codex run one script; in OpenCode
+the plugin starts it when a session's run ends. It re-reads the session, sums tokens
+per model **and minute**, and POSTs the **cumulative** total to
+`POST /api/v1/usage/sessions`. The server upserts on `cli:<sessionId>:<model>:<minute>`.
 
 Cumulative + upsert is the whole design. Hooks fire an unpredictable number of times,
 are retried, and can miss a turn entirely; sending totals-so-far means the row
@@ -188,7 +223,9 @@ never waits on a report. One worker runs at a time per CLI (`flock -n` on
 and the running worker drains it before it exits.
 
 The Claude Code worker keeps a byte offset per transcript file (and per subagent file)
-in `<state>/claude/state/`, and parses only the lines written since the last run. What
+in `<state>/claude/state/`, and parses only the lines written since the last run. The
+OpenCode worker keeps, in `<state>/opencode/state/`, the newest `time_updated` read per
+session and each counted message's own contribution (see below). What
 it keeps is the session's FULL running total per (model, minute), and it sends only the
 minutes whose total changed — still as totals, never deltas, so the upsert converges
 exactly as before. Deleting the state dir costs one full re-read and re-send, nothing
@@ -312,10 +349,62 @@ splits across two rows instead of crediting all of it to whichever one finished.
 rollouts; the same arithmetic was checked against all 324 real ones on the machine it
 was written on.
 
+### OpenCode
+
+OpenCode 2.x keeps every session in ONE SQLite database —
+`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db` — which the reporter opens
+**read-only** (`mode=ro`; it is in WAL mode, so reading beside the live service blocks
+nothing). Spend is on two message types in `session_message`: `assistant` (one model
+response, `data.model` + `data.tokens`) and `compaction` (the summary call). Its
+token block is not shaped like either vendor's, and each difference is silent when
+got wrong — read out of the 2.0.29 binary's own normaliser and then checked against
+the cost OpenCode recorded on 153 real Anthropic messages, which a fit reproduces to
+the cent:
+
+- **`output` EXCLUDES `reasoning`** — the opposite of Codex. OpenCode stores
+  `output - reasoning` as visible output and prices `output + reasoning` at the
+  output rate (the fit puts both at the same price, as two separate addends), so the
+  ledger's `completionTokens` is the SUM. Taking `output` alone dropped 30% of one
+  real session's output.
+- **`input` excludes both cache classes for every provider.** OpenCode has already
+  taken OpenAI's cached prefix out of `input_tokens`, so nothing is subtracted here —
+  doing what the Codex reporter does would take it out twice.
+- **`cache.write` is a 5-minute write on Anthropic.** OpenCode's default cache hint
+  names no TTL, and the recorded costs price the writes at exactly 1.25x input. On
+  OpenAI a write is billed as input and is folded into `promptTokens`, as Codex's is.
+- **The provider decides the row.** `providerID` `anthropic` is filed as `claude-cli`,
+  `openai` as `codex-cli` — the subscriptions they spend. Anything else (OpenCode's
+  own free models, OpenRouter, an API-key gateway) is skipped and logged under
+  `AGENTS_USAGE_DEBUG`. A session that switched providers sends one body per provider.
+
+The session tree:
+
+- **Subagents fold into their root**, like Claude Code's. A child session names its
+  parent in `parent_id`; a hook for any session in the tree reports the whole tree
+  under the root's id, so a child's spend is filed under exactly one id. A child is
+  never reported under its own.
+- **A fork does not re-count what it inherited.** Forking COPIES the source session's
+  messages — tokens included — into the new one, keeping each copy's original
+  `time_created`; OpenCode starts the fork's own totals at zero, and so does this, by
+  skipping every row older than the session it sits in.
+- **Rows are rewritten in place** while a response streams, so the worker re-reads by
+  `time_updated` and REPLACES a message's contribution by its id. Keeping
+  contributions also means a reverted (deleted) message stays counted: its quota was
+  spent either way. Every message is filed under the minute it was created, which
+  never moves.
+- **Compaction counts**, on the model it names; a failed one names none and counts
+  on the session's model, which is the model it ran on. **Title generation does
+  not**: OpenCode folds it into the session's totals with no model recorded anywhere —
+  roughly a thousand tokens a session or less, mostly cache, measured here.
+
+`python3 scripts/smoke_opencode_tally.py` pins all of the above against a synthetic
+database.
+
 ## Running this on the same host as the platform
 
 Safe, and deliberately so. **Only interactive sessions are reported** — `entrypoint:
-"cli"` in Claude Code, `originator: "codex-tui"` in Codex. Anything driven by the Agent
+"cli"` in Claude Code, `originator: "codex-tui"` in Codex. (OpenCode is the exception;
+see below.) Anything driven by the Agent
 SDK (`sdk-cli`) or by `codex exec` belongs to whatever program drove it, and that
 program is expected to meter itself — which is exactly what the platform does for every
 run on its `claude-cli` and `codex-cli` providers. Reporting those here would bill the
@@ -343,6 +432,13 @@ or `"entrypoints": ["cli", "sdk-cli"]` / `"originators": [...]` in the config fi
 on `AGENTS_USAGE_DEBUG=1` to see what each pass dropped — skips are logged, never
 silent.
 
+**OpenCode sessions are reported however they were started** — no origin filter.
+OpenCode records no equivalent of `entrypoint`, and the one program on this side that
+drives it, agent-tool-gateway (over `opencode acp`), meters nothing to the platform
+itself, so there is no second ledger write to double. The platform has no OpenCode
+provider. If something that DOES meter itself ever starts driving OpenCode on a
+reporting machine, this is the place that needs a filter.
+
 ## What each report names
 
 - `project` — the repo as `owner/repo` (`acme/backend`). The remote is the repo's real
@@ -369,15 +465,21 @@ silent.
   only a label either way: multi-device accounting is already correct without it,
   because the upsert key carries a session UUID that no two machines can collide on.
 - `accountId` — the Claude login's e-mail from `~/.claude.json`, or the ChatGPT
-  `account_id` from `~/.codex/auth.json`. The Codex e-mail is not used: it exists only
+  `account_id` from `~/.codex/auth.json`. For OpenCode, the e-mail of the OpenCode
+  login (the `account` table's `email` column, nothing else from it — the same table
+  holds that login's tokens, and `credential` the provider keys; neither is read).
+  That names who is signed in to OpenCode, not which Anthropic or OpenAI subscription
+  the provider key belongs to, and it is empty when nobody is signed in. The Codex e-mail is not used: it exists only
   inside a JWT sitting next to a live refresh token, and a reporter that starts taking
   credential files apart for a nicer label is one edit away from sending the credential.
 - `backend` — which endpoint served the session, because the server weights these
   tokens on the vendor's ratios and a partner backend (Bedrock, Vertex, a gateway, a
   proxy) is priced differently. Claude Code's transcript names none, so it is read from
   the environment — which works because the hook runs INSIDE the session it reports on.
-  Codex records `model_provider` in the rollout, so that one survives a backfill. The
-  base URL rides along sanitised (scheme, host, port and path only — never userinfo,
+  Codex records `model_provider` in the rollout, so that one survives a backfill.
+  OpenCode's is `firstParty` unless `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` in the
+  service's environment, or a `baseURL` in the global OpenCode config, points the
+  provider elsewhere. The base URL rides along sanitised (scheme, host, port and path only — never userinfo,
   query or fragment) so the server can CHECK the claim rather than take the name on
   trust.
 
@@ -401,6 +503,8 @@ echo '{"transcript_path":"'"$HOME"'/.claude/projects/<project>/<session>.jsonl"}
   | scripts/report_usage.py --print
 echo '{"transcript_path":"'"$HOME"'/.codex/sessions/2026/01/01/rollout-….jsonl"}' \
   | scripts/report_codex_usage.py --print
+scripts/report_opencode_usage.py --print                       # the latest session
+scripts/report_opencode_usage.py --print --session ses_…       # a given one (or its subagent)
 ```
 
 Turn on the log (`agents-usage.log`, beside the config) and watch a real hook:
@@ -408,7 +512,13 @@ Turn on the log (`agents-usage.log`, beside the config) and watch a real hook:
 ```bash
 AGENTS_USAGE_DEBUG=1 claude
 AGENTS_USAGE_DEBUG=1 codex
+AGENTS_USAGE_DEBUG=1 opencode --standalone   # a private server, so the plugin inherits it
+AGENTS_USAGE_DEBUG=1 AGENTS_USAGE_SYNC=1 scripts/report-opencode-usage.sh --session ses_…
 ```
+
+OpenCode's plugin runs inside its BACKGROUND service, so the variable has to be in
+that service's environment, not the terminal's — hence `--standalone`, or the last
+line, which reports one session in the foreground exactly as the plugin would.
 
 Catch up sessions that ended without a final hook — a crash, a killed terminal. Safe to
 re-run as often as you like, because the report is cumulative and the server upserts:
@@ -416,6 +526,7 @@ re-run as often as you like, because the report is cumulative and the server ups
 ```bash
 scripts/report-usage.sh --backfill 7          # Claude Code, last 7 days
 scripts/report-codex-usage.sh --backfill 7    # Codex
+scripts/report-opencode-usage.sh --backfill 7 # OpenCode
 ```
 
 And the arithmetic itself, plus the way this machine names itself:
@@ -423,16 +534,19 @@ And the arithmetic itself, plus the way this machine names itself:
 ```bash
 python3 scripts/smoke_transcript_tally.py   # Claude Code: dedup, subagents, the hour
 python3 scripts/smoke_codex_tally.py        # Codex: deltas, compaction, the hour
+python3 scripts/smoke_opencode_tally.py     # OpenCode: classes, providers, subagents, forks
 python3 scripts/smoke_device.py             # how this machine names itself
 ```
 
 ## Turning it off
 
 `AGENTS_USAGE_ENABLED=0`, or `"enabled": false` in the config, or
-`claude plugin disable agents-usage` / `codex plugin remove agents-usage@vt-plugins`.
-Removing the config file stops it too.
+`claude plugin disable agents-usage` / `codex plugin remove agents-usage@vt-plugins` /
+`rm ~/.config/opencode/plugin/agents-usage.js`. Removing the config file stops it too.
 
 ## Requirements
 
-`python3` (standard library only). No `jq`, no `curl`, no pip installs. Without it the
-hook exits 0 and reports nothing.
+`python3` (standard library only — OpenCode's database is read with its `sqlite3`
+module). No `jq`, no `curl`, no pip installs. Without it the hook exits 0 and reports
+nothing. OpenCode 2.x for the OpenCode plugin: it uses 2.x's plugin API
+(`export default { id, setup }`), which 1.x does not load.

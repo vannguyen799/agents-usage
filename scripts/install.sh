@@ -6,8 +6,9 @@
 #   1. works out which CLIs are on this machine and asks which to report from;
 #   2. asks for the platform URL, the API token and an optional device label,
 #      offering whatever a previous install already wrote as the default;
-#   3. writes ONE config file, chmod 600 (both reporters read either location);
-#   4. registers the marketplace WITH AUTO-UPDATE and installs the plugin.
+#   3. writes ONE config file, chmod 600 (every reporter reads every location);
+#   4. registers the marketplace WITH AUTO-UPDATE and installs the plugin — or, for
+#      OpenCode, links the plugin file into its plugin directory.
 #
 # It is safe to re-run: every step is a no-op when it is already done, and an
 # existing config is edited rather than replaced — so answering "keep" to the
@@ -36,7 +37,9 @@ usage() {
   cat <<'TXT'
 Usage: install.sh [options]
 
-  --platform claude|codex|both   which CLI to report from (default: ask)
+  --platform LIST                which CLIs to report from (default: ask) — any of
+                                 claude, codex, opencode, comma-separated; `both`
+                                 is claude,codex and `all` every one on this machine
   --url URL                      the agent platform's base URL
   --token aur_…                  a reporting key (see below)
   --device LABEL                 what to call this machine on /usage (default user@host)
@@ -130,7 +133,8 @@ reporter_dir() {
   for _candidate in \
     "$SCRIPT_DIR" \
     "$HOME/.claude/plugins/marketplaces/$MARKETPLACE/scripts" \
-    "$HOME/.codex/plugins/cache/$MARKETPLACE/$PLUGIN/scripts"
+    "$HOME/.codex/plugins/cache/$MARKETPLACE/$PLUGIN/scripts" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/$PLUGIN/scripts"
   do
     [ -n "$_candidate" ] && [ -f "$_candidate/report_usage.py" ] \
       && { printf '%s' "$_candidate"; return 0; }
@@ -141,51 +145,79 @@ reporter_dir() {
 # ------------------------------------------------------------
 # 1. which CLI
 # ------------------------------------------------------------
+# OpenCode's own installer puts it in ~/.opencode/bin and only a login shell's PATH
+# has that, so a non-interactive run (`curl | sh`, a fleet script) looks there too.
+OPENCODE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 have claude && HAS_CLAUDE=1 || HAS_CLAUDE=0
 have codex  && HAS_CODEX=1  || HAS_CODEX=0
-[ "$HAS_CLAUDE" = 1 ] || [ "$HAS_CODEX" = 1 ] \
-  || die "neither \`claude\` nor \`codex\` is on PATH — nothing to install into."
+{ have opencode || [ -x "$HOME/.opencode/bin/opencode" ]; } && HAS_OPENCODE=1 || HAS_OPENCODE=0
+[ "$HAS_CLAUDE" = 1 ] || [ "$HAS_CODEX" = 1 ] || [ "$HAS_OPENCODE" = 1 ] \
+  || die "none of \`claude\`, \`codex\` or \`opencode\` is on PATH — nothing to install into."
+
+# `all` means every CLI THIS machine has, so one fleet command fits every box; naming
+# a CLI that is not there is still an error, as it always was.
+INSTALLED=""
+[ "$HAS_CLAUDE" = 1 ]   && INSTALLED="$INSTALLED,claude"
+[ "$HAS_CODEX" = 1 ]    && INSTALLED="$INSTALLED,codex"
+[ "$HAS_OPENCODE" = 1 ] && INSTALLED="$INSTALLED,opencode"
+INSTALLED="${INSTALLED#,}"
 
 if [ -z "$PLATFORM" ]; then
   step "Which CLI should report its usage?"
   say "  1) Claude Code$([ "$HAS_CLAUDE" = 1 ] && echo '' || echo '   (not installed)')"
   say "  2) Codex CLI$([ "$HAS_CODEX" = 1 ] && echo '' || echo '     (not installed)')"
-  say "  3) both"
-  if   [ "$HAS_CLAUDE" = 1 ] && [ "$HAS_CODEX" = 1 ]; then _default=3
-  elif [ "$HAS_CLAUDE" = 1 ]; then _default=1
-  else _default=2; fi
+  say "  3) OpenCode$([ "$HAS_OPENCODE" = 1 ] && echo '' || echo '      (not installed)')"
+  say "  4) all of the installed ones ($INSTALLED)"
+  case "$INSTALLED" in
+    *,*)      _default=4 ;;
+    claude)   _default=1 ;;
+    codex)    _default=2 ;;
+    *)        _default=3 ;;
+  esac
   case "$(ask "  choice" "$_default")" in
     1) PLATFORM=claude ;;
     2) PLATFORM=codex ;;
-    3) PLATFORM=both ;;
-    *) die "pick 1, 2 or 3." ;;
+    3) PLATFORM=opencode ;;
+    4) PLATFORM=all ;;
+    *) die "pick 1, 2, 3 or 4." ;;
   esac
 fi
 
+WANT_CLAUDE=0; WANT_CODEX=0; WANT_OPENCODE=0
 case "$PLATFORM" in
-  claude) WANT_CLAUDE=1; WANT_CODEX=0 ;;
-  codex)  WANT_CLAUDE=0; WANT_CODEX=1 ;;
-  both)   WANT_CLAUDE=1; WANT_CODEX=1 ;;
-  *) die "--platform must be claude, codex or both." ;;
+  both) PLATFORM="claude,codex" ;;     # what `both` has always meant
+  all)  PLATFORM="$INSTALLED" ;;
 esac
-[ "$WANT_CLAUDE" = 1 ] && [ "$HAS_CLAUDE" = 0 ] && die "\`claude\` is not on PATH."
-[ "$WANT_CODEX"  = 1 ] && [ "$HAS_CODEX"  = 0 ] && die "\`codex\` is not on PATH."
+for _cli in $(printf '%s' "$PLATFORM" | tr ',' ' '); do
+  case "$_cli" in
+    claude)   WANT_CLAUDE=1 ;;
+    codex)    WANT_CODEX=1 ;;
+    opencode) WANT_OPENCODE=1 ;;
+    *) die "--platform takes claude, codex, opencode (comma-separated), both or all — not \`$_cli\`." ;;
+  esac
+done
+[ "$WANT_CLAUDE$WANT_CODEX$WANT_OPENCODE" != 000 ] || die "--platform named no CLI."
+[ "$WANT_CLAUDE"   = 1 ] && [ "$HAS_CLAUDE"   = 0 ] && die "\`claude\` is not on PATH."
+[ "$WANT_CODEX"    = 1 ] && [ "$HAS_CODEX"    = 0 ] && die "\`codex\` is not on PATH."
+[ "$WANT_OPENCODE" = 1 ] && [ "$HAS_OPENCODE" = 0 ] && die "\`opencode\` is not installed."
 
-# The config goes where the CLI being installed for keeps its own files. Both
-# reporters read both locations, so one file is enough even for `both`.
-if [ "$WANT_CLAUDE" = 1 ]; then CONFIG="$HOME/.claude/agents-usage.json"
-else CONFIG="$HOME/.codex/agents-usage.json"; fi
+# The config goes where the CLI being installed for keeps its own files. Every
+# reporter reads every location, so one file is enough for any combination.
+if   [ "$WANT_CLAUDE" = 1 ]; then CONFIG="$HOME/.claude/agents-usage.json"
+elif [ "$WANT_CODEX"  = 1 ]; then CONFIG="$HOME/.codex/agents-usage.json"
+else CONFIG="$OPENCODE_CONFIG_DIR/agents-usage.json"; fi
 
 # ------------------------------------------------------------
 # 2. the answers
 # ------------------------------------------------------------
 # Defaults come from whatever is already installed, so re-running this is a way to
 # change ONE field without having to retype a token.
-EXISTING=$("$PY" - "$HOME" <<'PY'
+EXISTING=$("$PY" - "$HOME" "$OPENCODE_CONFIG_DIR" <<'PY'
 import json, sys
 from pathlib import Path
 home = Path(sys.argv[1])
-for path in (home / ".claude/agents-usage.json", home / ".codex/agents-usage.json"):
+for path in (home / ".claude/agents-usage.json", home / ".codex/agents-usage.json",
+             Path(sys.argv[2]) / "agents-usage.json"):
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -234,6 +266,11 @@ fi
 
 [ -n "$DEVICE" ] || DEVICE=$(ask "  device label (blank = user@host)" "$(field device || true)")
 
+# "Keep the token" means keep the FILE that holds it. Writing the answers into this
+# CLI's own directory instead would leave a config with no token in front of the one
+# that has it — and the reporter, reading its own directory first, would go quiet.
+if [ "$TOKEN" = "$KEEP" ] && [ -n "$EXISTING" ]; then CONFIG="$(field path)"; fi
+
 # ------------------------------------------------------------
 # 3. the config file
 # ------------------------------------------------------------
@@ -254,6 +291,7 @@ try:
 except (OSError, ValueError):
     config = {}
 
+before = dict(config)
 config["url"] = url
 if token != keep:
     config["token"] = token
@@ -262,6 +300,10 @@ if device:
     config["device"] = device
 else:
     config.pop("device", None)
+if config == before:
+    # Re-running to install one more CLI must not rewrite the file the others read.
+    print(f"   unchanged  url={url}  token=kept")
+    sys.exit(0)
 
 # Written 0600 from the start and renamed into place: a token must never exist,
 # even for an instant, in a file the rest of the machine can read.
@@ -349,6 +391,35 @@ if [ "$WANT_CODEX" = 1 ]; then
   fi
 fi
 
+if [ "$WANT_OPENCODE" = 1 ]; then
+  step "OpenCode"
+  # OpenCode has no marketplace: a plugin is a file in its `plugin/` directory. It is
+  # LINKED, not copied — OpenCode follows the link, and the plugin finds the reporter
+  # through it — so whatever keeps the checkout it points into current updates both.
+  # Which checkout, in order: this working tree (--source local); the clone Claude
+  # Code's marketplace keeps current itself (autoUpdate, set above); else a clone of
+  # our own, which a re-run of this installer pulls.
+  CLAUDE_CLONE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
+  if [ "$SOURCE" = local ]; then
+    OPENCODE_ROOT="$REPO_ROOT"
+  elif [ -f "$CLAUDE_CLONE/opencode/agents-usage.js" ]; then
+    OPENCODE_ROOT="$CLAUDE_CLONE"
+  else
+    OPENCODE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/$PLUGIN"
+    have git || die "git is needed to fetch the OpenCode plugin."
+    if [ -d "$OPENCODE_ROOT/.git" ]; then
+      run_step git -C "$OPENCODE_ROOT" pull --ff-only || warn "could not update $OPENCODE_ROOT — keeping the copy there."
+    else
+      run_step git clone --depth 1 "https://github.com/$GITHUB_REPO.git" "$OPENCODE_ROOT" \
+        || die "could not clone $GITHUB_REPO into $OPENCODE_ROOT."
+    fi
+  fi
+  [ -f "$OPENCODE_ROOT/opencode/agents-usage.js" ] || die "no opencode/agents-usage.js in $OPENCODE_ROOT."
+  mkdir -p "$OPENCODE_CONFIG_DIR/plugin"
+  ln -sfn "$OPENCODE_ROOT/opencode/agents-usage.js" "$OPENCODE_CONFIG_DIR/plugin/agents-usage.js"
+  say "   $OPENCODE_CONFIG_DIR/plugin/agents-usage.js -> $OPENCODE_ROOT/opencode/agents-usage.js"
+fi
+
 # ------------------------------------------------------------
 step "Done"
 
@@ -358,8 +429,9 @@ REPORTER=$(reporter_dir) || REPORTER=""
 [ -n "$REPORTER" ] && AGENTS_USAGE_CONFIG="$CONFIG" \
   "$PY" "$REPORTER/report_usage.py" --set-device 2>/dev/null | sed 's/^/   /'
 
-say "Restart the CLI you installed into — hooks are read at startup."
+{ [ "$WANT_CLAUDE" = 1 ] || [ "$WANT_CODEX" = 1 ]; } && say "Restart the CLI you installed into — hooks are read at startup."
 [ "$WANT_CODEX" = 1 ] && say "Codex asks once to TRUST this plugin's hooks; until you do, nothing is reported."
+[ "$WANT_OPENCODE" = 1 ] && say "OpenCode's background service loads the plugin by itself — \`opencode plugin list\` shows it. If it does not, \`opencode service restart\` once no session is running."
 say ""
 say "Check it: AGENTS_USAGE_DEBUG=1 in the environment writes every attempt to"
 say "  $(dirname "$CONFIG")/agents-usage.log"
@@ -367,5 +439,6 @@ if [ -n "$REPORTER" ]; then
   say "Catch up sessions that ended without a hook (safe to re-run, the report is cumulative):"
   [ "$WANT_CLAUDE" = 1 ] && say "  $REPORTER/report-usage.sh --backfill 7"
   [ "$WANT_CODEX"  = 1 ] && say "  $REPORTER/report-codex-usage.sh --backfill 7"
+  [ "$WANT_OPENCODE" = 1 ] && say "  $REPORTER/report-opencode-usage.sh --backfill 7"
 fi
 exit 0

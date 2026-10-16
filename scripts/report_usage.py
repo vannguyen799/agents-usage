@@ -53,7 +53,7 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.11.0"
 """The reporter's version, and the only thing that says WHICH copy called.
 
 It sat at 0.1.0 through two releases, so the one place a server could tell an old
@@ -61,8 +61,8 @@ reporter from a new one named a version that had not run in months -- which matt
 the moment the wire shape changed and the server had to handle both. CI now fails a
 release where this disagrees with plugin.json, so it cannot drift again.
 
-The CODEX reporter imports it from here rather than keeping its own: two copies of a
-version string is two chances to ship one of them stale."""
+The CODEX and OPENCODE reporters import it from here rather than keeping their own:
+two copies of a version string is two chances to ship one of them stale."""
 
 USER_AGENT = f"agents-usage/{VERSION} (claude-code-hook)"
 """Sent on every report. urllib's default names Python and gets 403'd by a WAF."""
@@ -73,12 +73,15 @@ TIMEOUT_S = 5
 CONFIG_PATHS = (
     Path.home() / ".claude" / "agents-usage.json",
     Path.home() / ".codex" / "agents-usage.json",
+    (Path(os.environ.get("XDG_CONFIG_HOME", "").strip() or Path.home() / ".config")
+     / "opencode" / "agents-usage.json"),
 )
-"""Where the url and token live — ONE file serves both reporters, because the
+"""Where the url and token live — ONE file serves every reporter, because the
 credential belongs to the platform and not to a CLI. This is the fallback ORDER; each
 reporter puts its own CLI's directory in front of it (see `config_paths`), and
 `AGENTS_USAGE_CONFIG` in front of that. `~/.claude` leads the fallback because it is
-where every copy installed so far already wrote one."""
+where every copy installed so far already wrote one; OpenCode's comes last, so a
+machine that only ever installed OpenCode is still found by the other two."""
 
 DEFAULT_ENTRYPOINTS = ("cli",)
 """Transcript origins worth reporting — see trap 2. Widen with AGENTS_USAGE_ENTRYPOINTS."""
@@ -1201,12 +1204,17 @@ def merge_bodies(older: dict, newer: dict) -> dict:
     return merged
 
 
-def deliver(config: dict, body: dict, spool: Path, user_agent: str = USER_AGENT) -> str:
+def deliver(config: dict, body: dict, spool: Path, user_agent: str = USER_AGENT,
+            spool_key: str | None = None) -> str:
     """
     Send one report, folding in whatever is spooled for the same session first, and
     spool the lot when the platform cannot take it now. Returns the outcome.
+
+    `spool_key` defaults to the session id. A reporter that sends one session as more
+    than one body — OpenCode, one per provider — names a key per body, or the merge
+    would file one provider's entries under the other's.
     """
-    parked = spool / f"{_key_of(str(body.get('sessionId')))}.json"
+    parked = spool / f"{_key_of(spool_key or str(body.get('sessionId')))}.json"
     earlier = read_json(parked)
     if isinstance(earlier, dict):
         body = merge_bodies(earlier, body)
@@ -1409,7 +1417,9 @@ class WorkerLock:
 
 def drain(root: Path, handle) -> int:
     """Process every queued payload; returns how many. The newest payload per
-    transcript is all that matters — the report is cumulative — so repeats collapse."""
+    transcript is all that matters — the report is cumulative — so repeats collapse.
+    A payload that names no transcript (OpenCode's: one database, many sessions)
+    collapses on its session id instead, never into one shared empty key."""
     try:
         items = sorted((root / "queue").glob("*.json"))
     except OSError:
@@ -1424,7 +1434,8 @@ def drain(root: Path, handle) -> int:
         if not isinstance(queued, dict) or not isinstance(queued.get("payload"), dict):
             continue
         payload = queued["payload"]
-        where = str(payload.get("transcript_path") or payload.get("transcriptPath") or "")
+        where = str(payload.get("transcript_path") or payload.get("transcriptPath")
+                    or payload.get("session_id") or payload.get("sessionId") or "")
         latest.pop(where, None)  # re-insert so the order stays "most recent last"
         latest[where] = queued
     for queued in latest.values():

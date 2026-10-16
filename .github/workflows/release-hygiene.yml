@@ -51,15 +51,20 @@ jobs:
             echo "::error::It is the only thing in the User-Agent telling a server which copy called."
             exit 1
           fi
-          # Both reporters build their User-Agent from that one constant, so this
-          # check covers the Codex one too. Prove it rather than assume it:
-          if ! grep -q 'from report_usage import' scripts/report_codex_usage.py; then
-            echo "::error::the Codex reporter no longer shares VERSION — check it separately."
-            exit 1
-          fi
+          # Every reporter builds its User-Agent from that one constant, so this
+          # check covers the Codex and OpenCode ones too. Prove it rather than assume it:
+          for other in report_codex_usage.py report_opencode_usage.py; do
+            if ! grep -q 'from report_usage import' "scripts/$other"; then
+              echo "::error::$other no longer shares VERSION — check it separately."
+              exit 1
+            fi
+          done
 
       - name: the tally must still be pinned
         run: python3 scripts/smoke_codex_tally.py
+
+      - name: and the OpenCode one
+        run: python3 scripts/smoke_opencode_tally.py
 
       - name: and so must the way this machine names itself
         run: python3 scripts/smoke_device.py
@@ -78,7 +83,7 @@ jobs:
             echo "base $BASE not in this clone — skipping"; exit 0
           fi
 
-          changed=$(git diff --name-only "$BASE" HEAD -- scripts hooks)
+          changed=$(git diff --name-only "$BASE" HEAD -- scripts hooks opencode)
           if [ -z "$changed" ]; then
             echo "no script or hook change in this range — nothing to enforce"; exit 0
           fi
@@ -88,7 +93,7 @@ jobs:
           after=$(jq -r '.version' .claude-plugin/plugin.json)
           echo "version $before -> $after"
           if [ "$before" = "$after" ]; then
-            echo "::error::scripts/ or hooks/ changed but plugin.json is still $after."
+            echo "::error::scripts/, hooks/ or opencode/ changed but plugin.json is still $after."
             echo "::error::Installed copies refresh by VERSION, so this change would reach no one. Bump it."
             exit 1
           fi
