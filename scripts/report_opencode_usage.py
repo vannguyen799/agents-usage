@@ -4,8 +4,8 @@ Report an OpenCode session's token usage to the agent platform's usage ledger.
 
 WHY THIS EXISTS
     The same gap the Claude Code and Codex reporters close, on a third harness.
-    OpenCode signed in to Anthropic or OpenAI spends the SAME Pro/Max/Plus quota as
-    the vendor's own CLI, and the platform sees none of it. Its rows are filed under
+    OpenCode signed in with a Claude or ChatGPT SUBSCRIPTION login spends the same
+    Pro/Max/Plus quota as the vendor's own CLI, and the platform sees none of it. Its rows are filed under
     the CLI whose quota they spent — `claude-cli` for Anthropic, `codex-cli` for
     OpenAI — so /usage shows one subscription's burn on one line whichever harness
     spent it.
@@ -25,7 +25,7 @@ WHAT IT READS
     into `session_v2`'s own totals with no model attached — so it is not reported:
     about a thousand tokens per session or less, against a model nothing names.
 
-THE FIVE TRAPS THIS AVOIDS
+THE SIX TRAPS THIS AVOIDS
     1. `tokens.output` EXCLUDES `tokens.reasoning` — the opposite of Codex, where
        reasoning is a subset of output. OpenCode stores `output - reasoning` as
        "visible" output and prices `(output + reasoning)` at the output rate, so the
@@ -56,6 +56,11 @@ THE FIVE TRAPS THIS AVOIDS
        Anything else — OpenCode's own free models, OpenRouter, an API-key gateway —
        spends no subscription the platform meters, and the server would refuse the
        provider anyway. Skipped, and said so under AGENTS_USAGE_DEBUG.
+
+    6. ...and only when OpenCode is signed in to that provider with a SUBSCRIPTION
+       login. The rows are filed as `claude-cli` / `codex-cli` at $0, i.e. as Pro/Max
+       or ChatGPT QUOTA; a session OpenCode ran on an API key was billed per call
+       and is not that, however identical its tokens look. See `subscriptions`.
 
 NO ORIGIN FILTER
     Unlike Claude Code (`entrypoint`) and Codex (`originator`), every OpenCode
@@ -198,7 +203,76 @@ def classes(tokens: dict, provider: str) -> dict:
     return counts
 
 
-def contribution(raw: str, created_ms: int, fallback: dict):
+# ------------------------------------------------------------------------------------
+# Whose money: a subscription login, or a key billed per call (trap 6)
+# ------------------------------------------------------------------------------------
+
+API_KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+"""The variable each provider's key can come from instead of a stored credential."""
+
+PER_CALL = "billed per call, not subscription quota"
+
+
+def subscriptions(conn: sqlite3.Connection, env_keys: dict) -> dict:
+    """
+    `{cli: reason}` for the two reported providers — "" when the spend is subscription
+    quota and may be reported, else why it is not.
+
+    Decided by the provider's ACTIVE credential in OpenCode's `credential` table, and
+    only by its TYPE. 2.0.29 keeps the type inside the `value` JSON — the row's own
+    `method_id` / `connector_id` columns are never written — next to the secret, so
+    `type` and `methodID` are pulled out by SQLite's `json_extract` and nothing else
+    of `value` is ever selected: the key or token never enters this process.
+
+    The types 2.0.29 writes: `oauth` (a login; OpenAI's ChatGPT one has methodID
+    `chatgpt-token-sharing`, migrated from the 1.x `chatgpt-browser`, and a Claude
+    Pro/Max login imported from 1.x has `oauth`), `key` (an API key, including the
+    1.x `api` and `wellknown` ones it imports) and `external` (another tool's
+    credential, e.g. azure-cli). Only `oauth` is a subscription. Everything else —
+    a key, no credential at all, a type this release does not know, a database too
+    old for `json_extract` — is skipped: under-reporting is visible and can be
+    backfilled once fixed, a pay-per-call session filed as quota cannot be told
+    apart from real quota afterwards.
+
+    An API key in the environment (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, in the
+    environment OpenCode's service runs with) skips the provider even beside an OAuth
+    credential: which of the two OpenCode used is not recorded, and the doubt
+    resolves the safe way. Only the variable's PRESENCE is looked at.
+
+    This is the auth of NOW, not of the moment each message was spent. Reports run
+    at the end of every turn, so the two only part when the login changes between a
+    session's spend and its report — a `--backfill`, a first report after a reset.
+    """
+    found: dict = {}
+    try:
+        rows = conn.execute(
+            "SELECT integration_id, json_extract(value, '$.type'), json_extract(value, '$.methodID') "
+            "FROM credential WHERE integration_id IN ('anthropic', 'openai') "
+            "ORDER BY active DESC, time_updated DESC"
+        ).fetchall()
+    except sqlite3.Error as err:
+        log(f"opencode: credential types unreadable ({err!r}) — reporting nothing")
+        rows = []
+    for integration, kind, method in rows:
+        found.setdefault(integration, (str(kind or ""), str(method or "")))
+
+    verdict = {}
+    for pid, cli in PROVIDERS.items():
+        kind, method = found.get(pid, ("", ""))
+        if env_keys.get(pid):
+            verdict[cli] = f"{PER_CALL} ({API_KEY_ENV[pid]} is set)"
+        elif kind == "oauth":
+            verdict[cli] = ""
+        elif kind == "key":
+            verdict[cli] = f"{PER_CALL} ({pid} signs in with an API key)"
+        elif not kind:
+            verdict[cli] = f"{PER_CALL} (no {pid} login stored)"
+        else:
+            verdict[cli] = f"{PER_CALL} ({pid} credential type {kind!r} is not a subscription login)"
+    return verdict
+
+
+def contribution(raw: str, created_ms: int, fallback: dict, auth: dict):
     """
     One message row -> `[provider, model, minute, stamp, counts]`, or `(None, why)`.
 
@@ -222,6 +296,8 @@ def contribution(raw: str, created_ms: int, fallback: dict):
     model = str(ref.get("id") or "").strip()
     if not provider:
         return None, f"provider {ref.get('providerID')!r} is not reported"
+    if auth.get(provider, PER_CALL):
+        return None, auth.get(provider, PER_CALL)
     if not model:
         return None, "no model named"
     counts = classes(tokens, provider)
@@ -268,10 +344,14 @@ def load_state(raw):
         return None
 
 
-def advance(conn: sqlite3.Connection, state: dict, root: str) -> str:
+def advance(conn: sqlite3.Connection, state: dict, root: str, auth: dict) -> str:
     """
     Fold every row of the tree written or rewritten since the last read into `state`.
-    Returns the root session's directory.
+    Returns the root session's directory. `auth` is `subscriptions`' verdict.
+
+    A message skipped for its provider's auth is not looked at again unless OpenCode
+    rewrites it, so a login that changes later neither adds old key-billed spend nor
+    removes spend already counted under a subscription.
 
     `>=` the mark, not `>`: two writes can share a millisecond, and re-reading the
     newest row is free — it replaces its own contribution with the same one.
@@ -289,7 +369,7 @@ def advance(conn: sqlite3.Connection, state: dict, root: str) -> str:
             if created < born:
                 why = "inherited from the session it was forked from"  # trap 3
             else:
-                entry, why = contribution(raw, created, fallback)
+                entry, why = contribution(raw, created, fallback, auth)
                 if entry:
                     state["msgs"][message] = entry
                     continue
@@ -393,8 +473,12 @@ def backend_of(provider_id: str) -> tuple:
 
 def hook_context() -> dict:
     """The environment-derived fields, read in the HOOK's process — which OpenCode's
-    service spawned, so its environment is the one the session ran under."""
-    return {"backend": {cli: list(backend_of(pid)) for pid, cli in PROVIDERS.items()}}
+    service spawned, so its environment is the one the session ran under. Of the API
+    key variables, only whether each is SET."""
+    return {
+        "backend": {cli: list(backend_of(pid)) for pid, cli in PROVIDERS.items()},
+        "envKeys": {pid: bool(os.environ.get(var, "").strip()) for pid, var in API_KEY_ENV.items()},
+    }
 
 
 def project_from(directory: str) -> str:
@@ -451,7 +535,8 @@ def report_session(config: dict, session_id: str, context: dict | None = None,
                 return "idle"
             state_path = root / "state" / f"{_key_of(f'{db.resolve()}:{top}')}.json"
             state = load_state(read_json(state_path)) or new_state()
-            directory = advance(conn, state, top)
+            auth = subscriptions(conn, (context or hook_context()).get("envKeys") or {})
+            directory = advance(conn, state, top, auth)
             account = account_of(conn)
     except sqlite3.Error as err:
         log(f"opencode {session_id}: database unreadable: {err!r}")
@@ -483,7 +568,7 @@ def print_session(config: dict, session_id: str, db: Path | None = None) -> None
             print(f"no session {session_id} in {db}", file=sys.stderr)
             return
         state = new_state()
-        directory = advance(conn, state, top)
+        directory = advance(conn, state, top, subscriptions(conn, hook_context()["envKeys"]))
         account = account_of(conn)
     for provider, per_key in sorted(tallies(state).items()):
         print(json.dumps(body_of(config, top, provider, per_key, directory, account), indent=2))

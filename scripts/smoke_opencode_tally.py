@@ -29,7 +29,7 @@ GPT = {"id": "gpt-5.6-terra", "providerID": "openai"}
 FREE = {"id": "big-pickle", "providerID": "opencode"}
 
 CONFIG = {"url": "https://platform.test", "token": "aur_x", "enabled": True, "device": "box"}
-CONTEXT = {"backend": {"claude-cli": ["firstParty", ""], "codex-cli": ["firstParty", ""]}}
+CONTEXT = {"backend": {"claude-cli": ["firstParty", ""], "codex-cli": ["firstParty", ""]}, "envKeys": {}}
 
 SCHEMA = """
 CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, fork_session_id TEXT,
@@ -39,7 +39,15 @@ CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, typ
 CREATE TABLE account (id TEXT PRIMARY KEY, email TEXT NOT NULL, url TEXT NOT NULL,
   access_token TEXT NOT NULL, refresh_token TEXT NOT NULL);
 CREATE TABLE account_state (id INTEGER PRIMARY KEY, active_account_id TEXT);
+CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL,
+  connector_id TEXT, method_id TEXT, active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
 """
+
+OAUTH = {"anthropic": {"type": "oauth", "methodID": "oauth", "refresh": "SECRET-R", "access": "SECRET-A", "expires": 1},
+         "openai": {"type": "oauth", "methodID": "chatgpt-token-sharing", "refresh": "SECRET-R", "access": "SECRET-A",
+                    "expires": 1}}
+"""What OpenCode 2.0.29 stores for a subscription login — the default for every
+database below, so the cases that are not about auth are not skipped for it."""
 
 
 def check(name: str, got, want) -> None:
@@ -58,12 +66,24 @@ def ms(at: str) -> int:
 class Db:
     """A throwaway opencode.db, written the way OpenCode writes it."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, logins: dict = OAUTH):
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / "opencode.db"
         self.conn = sqlite3.connect(self.path)
         self.conn.executescript(SCHEMA)
         self.seq = {}
+        for integration, value in logins.items():
+            self.credential(integration, value)
+
+    def credential(self, integration: str, value: dict, active: int = 1):
+        """A credential row as 2.0.29 inserts it: the type lives in `value`, next to the
+        secret, and `method_id` / `connector_id` stay NULL."""
+        if active:
+            self.conn.execute("UPDATE credential SET active = 0 WHERE integration_id = ?", (integration,))
+        self.conn.execute("INSERT INTO credential VALUES (?,?,?,?,?,?,?,?,?)",
+                          (f"cred_{integration}_{len(self.seq)}_{value['type']}_{active}", integration, "x",
+                           json.dumps(value), None, None, active, 1, 1))
+        self.conn.commit()
 
     def session(self, sid: str, born: str, parent: str = None, fork: str = None, model: dict = OPUS):
         self.conn.execute("INSERT INTO session_v2 VALUES (?,?,?,?,?,?,?)",
@@ -98,11 +118,12 @@ class Db:
         self.conn.commit()
 
 
-def tally(db: Db, session: str) -> dict:
+def tally(db: Db, session: str, env_keys: dict = None) -> dict:
     """Full, stateless read: {provider: {(model, minute): counts}} with spans stripped."""
     with reporter.open_db(db.path) as conn:
         state = reporter.new_state()
-        reporter.advance(conn, state, reporter.root_of(conn, session))
+        auth = reporter.subscriptions(conn, env_keys or {})
+        reporter.advance(conn, state, reporter.root_of(conn, session), auth)
     return {p: {k: {f: v for f, v in t.items() if f not in ("startedAt", "endedAt")} for k, t in per.items()}
             for p, per in reporter.tallies(state).items()}
 
@@ -152,7 +173,7 @@ with tempfile.TemporaryDirectory() as directory:
     db.message("msg_3", "ses_m", "2026-10-15T13:40:00", input_tokens=40, output=4)
     with reporter.open_db(db.path) as conn:
         state = reporter.new_state()
-        reporter.advance(conn, state, "ses_m")
+        reporter.advance(conn, state, "ses_m", reporter.subscriptions(conn, {}))
     per = reporter.tallies(state)["claude-cli"]
     check("one session spanning two hours is two minute rows",
           {k: v["promptTokens"] for k, v in per.items()},
@@ -177,6 +198,40 @@ with tempfile.TemporaryDirectory() as directory:
           {"claude-cli": ["claude-opus-5-5"], "codex-cli": ["gpt-5.6-terra"]})
     check("…and the skipped provider's tokens are nowhere",
           sum(v["promptTokens"] for per in got.values() for v in per.values()), 60)
+
+    print("\nonly a subscription login is quota")
+    def mixed(logins):
+        db = Db(tmp / f"auth-{len(list(tmp.iterdir()))}", logins)
+        db.session("ses_x", "2026-10-15T12:00:00")
+        db.message("msg_1", "ses_x", "2026-10-15T12:05:00", input_tokens=10, output=1)
+        db.message("msg_2", "ses_x", "2026-10-15T12:05:30", model=GPT, input_tokens=20, output=2)
+        return db
+    check("an OAuth login on both: both reported",
+          sorted(tally(mixed(OAUTH), "ses_x")), ["claude-cli", "codex-cli"])
+    check("an Anthropic API KEY (what this box has): Anthropic skipped, the ChatGPT login kept",
+          sorted(tally(mixed({"anthropic": {"type": "key", "key": "SECRET-K"}, "openai": OAUTH["openai"]}), "ses_x")),
+          ["codex-cli"])
+    check("no credential stored at all: nothing reported",
+          tally(mixed({}), "ses_x"), {})
+    check("a type this release does not know (or `external`): skipped",
+          tally(mixed({"anthropic": {"type": "external", "methodID": "x"},
+                       "openai": {"type": "wormhole"}}), "ses_x"), {})
+    check("an API key in the service's environment beats an OAuth login",
+          sorted(tally(mixed(OAUTH), "ses_x", env_keys={"anthropic": True})), ["codex-cli"])
+    db = mixed({"anthropic": {"type": "key", "key": "SECRET-K"}})
+    db.credential("anthropic", OAUTH["anthropic"], active=0)
+    check("the ACTIVE credential decides, not any credential",
+          tally(db, "ses_x"), {})
+    with reporter.open_db(db.path) as conn:
+        statements = []
+        conn.set_trace_callback(statements.append)
+        verdict = reporter.subscriptions(conn, {})
+    check("…and says why, for the debug log", verdict["claude-cli"],
+          "billed per call, not subscription quota (anthropic signs in with an API key)")
+    selected = " ".join(statements).replace("json_extract(value, '$.type')", "") \
+        .replace("json_extract(value, '$.methodID')", "")
+    check("the credential's `value` is never selected whole — only its type and methodID",
+          "value" in selected, False)
 
     print("\nsubagents fold into the session that spawned them")
     db = Db(tmp / "tree")
@@ -264,7 +319,7 @@ with tempfile.TemporaryDirectory() as directory:
                                                            "2026-10-15T12:05:00Z")]["promptTokens"], 10)
     with reporter.open_db(db.path) as conn:
         full = reporter.new_state()
-        reporter.advance(conn, full, "ses_i")
+        reporter.advance(conn, full, "ses_i", reporter.subscriptions(conn, {}))
     expected = {("ses_i", e["model"], e["bucket"]): {k: v for k, v in e.items() if k not in ("model", "bucket")}
                 for e in shared.wire_models(reporter.tallies(full)["claude-cli"], cap=False)}
     check("after every increment the platform holds the full re-read's rows (bar the reverted one)",

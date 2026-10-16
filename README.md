@@ -6,7 +6,8 @@ not just the half the platform spent itself.
 
 The platform meters agents that run on its `claude-cli` and `codex-cli` providers. A
 human typing into either CLI on the same login spends the same Pro/Max/Plus quota and
-the platform sees none of it — and so does OpenCode signed in to Anthropic or OpenAI.
+the platform sees none of it — and so does OpenCode signed in with a Claude or
+ChatGPT subscription login.
 This plugin closes that gap, for all three, from one install.
 
 ## Install
@@ -376,6 +377,27 @@ the cent:
   `openai` as `codex-cli` — the subscriptions they spend. Anything else (OpenCode's
   own free models, OpenRouter, an API-key gateway) is skipped and logged under
   `AGENTS_USAGE_DEBUG`. A session that switched providers sends one body per provider.
+- **Only a subscription login is quota.** Those rows are filed at $0 as Pro/Max or
+  ChatGPT quota, so a provider is reported only while OpenCode's ACTIVE credential for
+  it is an OAuth login — read from the credential's `type` alone (2.0.29 keeps it in
+  the `value` JSON beside the secret; SQLite's `json_extract` pulls out `type` and
+  `methodID` and nothing else of `value` is ever selected). `oauth` is reported: the
+  ChatGPT login (`methodID` `chatgpt-token-sharing`), or a Claude Pro/Max login carried
+  over from OpenCode 1.x — 2.0.29 itself ships no Anthropic OAuth, so Anthropic in
+  OpenCode is usually an API key. An API key (`key`), no stored credential, any other
+  type (`external`, or one a later release adds), and an `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` in the environment of OpenCode's service (even beside an OAuth
+  login — which of the two was used is not recorded) are all skipped as "billed per
+  call, not subscription quota", under `AGENTS_USAGE_DEBUG`. Unknown means skip:
+  under-reporting can be backfilled once fixed, a pay-per-call session filed as
+  quota cannot be told apart from real quota afterwards.
+
+  **The auth checked is the auth of NOW**, not of the moment a message was spent —
+  OpenCode records no login against a message. Reports run at the end of every turn,
+  so the two only part when the login changes between a session's spend and its
+  report: a `--backfill` over sessions spent under an earlier login, or a first report
+  after the state dir was deleted. A message is judged once, when first read, and not
+  re-judged later unless OpenCode rewrites it.
 
 The session tree:
 
